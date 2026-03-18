@@ -1,0 +1,43 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Dependency directories
+node_modules/
+vendor/
+
+# Build output
+dist/
+build/
+out/
+*.pyc
+__pycache__/
+
+# Python virtual environment
+venv/
+.env/
+.venv/
+
+# Environment files
+.env
+.env.local
+.env.*
+
+# Data & Documents
+*.xlsx
+*.xls
+*.pdf
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.txt
+!requirements.txt
+!README.md
+!system_prompt.md

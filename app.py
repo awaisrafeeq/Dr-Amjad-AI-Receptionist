@@ -1,0 +1,102 @@
+import os
+import logging
+import sys
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
+import uvicorn
+from routers import (acs_call_events_router, document_router, appointments_router)
+from contextlib import asynccontextmanager
+
+from utils.session_manager import session_manager
+
+
+# Setup logging to both console and file
+log_dir = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(log_dir, exist_ok=True)
+
+log_file = os.path.join(log_dir, f"app_{datetime.now().strftime('%Y%m%d')}.log")
+
+# Create formatter
+formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# Console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+
+# File handler (10MB per file, keep 5 backup files)
+file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(formatter)
+
+# Configure root logger
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[console_handler, file_handler],
+    force=True
+)
+
+logger = logging.getLogger(__name__)
+logger.info(f"Logging to file: {log_file}")
+
+# Suppress noisy third-party loggers
+logging.getLogger("watchfiles").setLevel(logging.WARNING)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize services on startup and cleanup on shutdown."""
+    # Startup
+    logger.info("Initializing Azure Storage Logger and Session Manager...")
+    try:
+        await session_manager.initialize()
+        logger.info("Services initialized successfully!")
+    except Exception as e:
+        logger.error(f"Failed to initialize services: {e}")
+        # The instruction implies enabling the session manager, so we should not continue without it.
+        # Re-raising the exception or letting it propagate will prevent the app from starting if initialization fails.
+        raise # Re-raise the exception to prevent the app from starting without session manager
+    
+    yield
+
+# FastAPI app
+app = FastAPI(
+    title="Hospital Reception Bot",
+    description="AI backend for hospital reception bot",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False, 
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --- Endpoints ---
+
+@app.get("/")
+async def root():
+    return {"status": "Hospital Reception Agent is running"}
+    
+app.include_router(acs_call_events_router)
+app.include_router(document_router)
+app.include_router(appointments_router)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8001))
+    uvicorn.run(
+        "app:app",
+        host="127.0.0.1",
+        port=port,
+        reload=True 
+    )

@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "@azure/communication-calling": "^1.27.2",
+    "@azure/communication-common": "^2.3.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.5"
+  }
+}

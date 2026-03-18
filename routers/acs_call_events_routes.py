@@ -1,0 +1,279 @@
+import logging
+from fastapi import Request, WebSocket, APIRouter
+from azure.eventgrid import EventGridEvent, SystemEventNames
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+import uuid
+from urllib.parse import urlencode
+from azure.core.messaging import CloudEvent
+from utils.acs import acs_caller
+from utils.rtmt import rtmt
+from utils.session_manager import session_manager
+import json
+from datetime import datetime, timezone
+import asyncio
+from fastapi import WebSocketDisconnect
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+# --- Setup ACS ---
+caller = acs_caller
+
+
+# --- Setup OpenAI Realtime bridge ---
+rtmt = rtmt
+
+session_id = None
+
+@router.post("/acs/incoming", tags=['ACS Call Events'])
+async def inbound_call(request: Request):
+    """Handles inbound ACS call events."""
+    # Handle incoming call events
+    try:
+        event_data = await request.json()
+        logger.info(f"Received ACS event data: {event_data}")
+
+        if isinstance(event_data, dict):
+            event_data = [event_data]
+        elif not isinstance(event_data, list):
+            event_data = [event_data]
+        
+        # EventGrid sends events in an array
+        for event_dict in event_data:
+            logger.info(f"Processing event: {event_dict}")
+            event = EventGridEvent.from_dict(event_dict)
+            
+            if event.event_type == SystemEventNames.EventGridSubscriptionValidationEventName:
+                logger.info("Validating subscription")
+                validation_code = event.data["validationCode"]
+                return JSONResponse(content={"validationResponse": validation_code}, status_code=200)
+            
+            elif event.event_type == "Microsoft.Communication.IncomingCall":
+                logger.info(f"Incoming call event data: {event}")
+                incoming_call_context = event.data['incomingCallContext']
+                if event.data["from"]["kind"] == "phoneNumber":
+                    caller_id = event.data["from"]["phoneNumber"]["value"]
+                else:
+                    caller_id = event.data["from"]["rawId"]
+                logger.info(f"Incoming call answered from: {caller_id}")
+                
+                guid = uuid.uuid4()
+                query_parameters = urlencode({"callerId": caller_id})
+                callback_uri = f"{caller.acs_callback_path}/{guid}?{query_parameters}"
+                logger.info("callback url: %s", callback_uri)
+                
+                await caller.answer_inbound_call(incoming_call_context, callback_uri)
+                
+                # create a new session ID for this call
+                global session_id
+                try:
+                    event_payload = event.data
+                    if isinstance(event_payload, str):
+                        event_payload = json.loads(event_payload)
+                    session_id = await session_manager.create_session(event_payload, event.event_type)
+                except Exception as session_error:
+                    logger.error(f"Session creation error (non-fatal): {session_error}")
+                
+                return Response(status_code=200)
+            
+    except Exception as e:
+        logger.exception("Error handling inbound call")
+        try:
+            event = {
+                "event_type": "error",
+                "details": str(e),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            if session_id:
+                await session_manager.log_event(
+                    session_id=session_id,
+                    event_data=event
+                )
+        except Exception as log_error:
+            logger.error(f"Error logging inbound call failure (ignored): {log_error}")
+
+        return Response(status_code=200)
+
+    
+@router.post("/acs/callbacks/{contextId}", tags=['ACS Call Events'])
+async def handle_callback(contextId: str, request: Request):
+    """
+    Handle ACS call lifecycle callbacks (CallConnected, RecognizeCompleted, PlayCompleted, etc.).
+    """
+    try:
+        callbacks = await request.json()
+        caller_id = request.query_params.get("callerId", "").strip()
+        
+        if "+" not in caller_id and caller_id:
+            caller_id = "+" + caller_id
+
+        for event_dict in callbacks:
+            event = CloudEvent.from_dict(event_dict)
+            logger.info(event.type)
+
+            logger.info("call event data=%s", event.data)
+            call_connection_id = event.data['callConnectionId']
+            
+            generic_event = {
+                "event_type": event.type,            # e.g., 'CallConnected'
+                "callConnectionId": event.data.get("callConnectionId"),
+                "serverCallId": event.data.get("serverCallId"),
+                "correlationId": event.data.get("correlationId"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": 'active',
+                "details": {}                        # store event-specific fields here
+            }
+
+            if event.type == "Microsoft.Communication.CallConnected":
+                generic_event["details"]["operationContext"] = event.data.get("operationContext")
+                
+                await session_manager.log_event(
+                    session_id=session_id,
+                    event_data=generic_event
+                )
+            
+            elif event.type == "Microsoft.Communication.ParticipantsUpdated":
+                generic_event["details"]["participants"] = event.data.get("participants")
+                generic_event["details"]["sequenceNumber"] = event.data.get("sequenceNumber")
+                
+                await session_manager.log_event(
+                    session_id=session_id,
+                    event_data=generic_event
+                )
+                
+            elif event.type == "Microsoft.Communication.RecognizeCompleted":
+                pass
+
+            elif event.type == "Microsoft.Communication.PlayCompleted":
+                pass
+            
+            elif event.type == "Microsoft.Communication.SpeechSynthesisCompleted":
+                pass
+            
+            elif event.type == "Microsoft.Communication.SpeechSynthesisStarted":
+                pass
+            
+            elif event.type == "Microsoft.Communication.RecognizeStarted":
+                pass
+            
+                
+            elif event.type == "Microsoft.Communication.MediaStreamingStarted":
+                generic_event["details"]["mediaStreamingUpdate"] = event.data.get("mediaStreamingUpdate")
+                
+                await session_manager.log_event(
+                    session_id=session_id,
+                    event_data=generic_event
+                )
+                
+            elif event.type == "Microsoft.Communication.MediaStreamingStopped":
+                generic_event["details"]["mediaStreamingUpdate"] = event.data.get("mediaStreamingUpdate")
+                
+                await session_manager.log_event(
+                    session_id=session_id,
+                    event_data=generic_event
+                )
+                
+            elif event.type == "Microsoft.Communication.MediaStreamingFailed":
+                generic_event["details"]["mediaStreamingUpdate"] = event.data.get("mediaStreamingUpdate")
+                generic_event["status"] = 'error'
+                
+                await session_manager.log_event(
+                    session_id=session_id,
+                    event_data=generic_event
+                )
+                
+            elif event.type == "Microsoft.Communication.CallDisconnected":
+                generic_event["details"]["operationContext"] = event.data.get("operationContext")
+                generic_event["details"]["resultInformation"] = event.data.get("resultInformation")
+                generic_event["status"] = 'disconnected'
+                
+                
+                # End the session
+                await session_manager.end_session(
+                    session_id=session_id,
+                    event_data=generic_event
+                )
+
+
+    except Exception as ex:
+        logger.exception("error in event handling: %s", ex)
+        event = {
+            "event_type": "error",
+            "details": str(ex),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        await session_manager.log_event(
+            session_id=session_id,
+            event_data=event
+        )
+    return Response(status_code=200)   
+
+@router.websocket("/realtime-acs")
+async def websocket_handler_acs(websocket: WebSocket):
+    """Handles ACS <-> OpenAI Realtime audio streaming."""
+    await websocket.accept()
+    
+    # Try to get session context from query parameters or headers
+    # ws_session_id = websocket.query_params.get("session_id")
+    
+    try:
+        # Add a timeout to prevent hanging connections
+        await asyncio.wait_for(
+            rtmt.forward_messages(websocket, is_acs_audio_stream=True, session_id=session_id),
+            timeout=None  # You can set a reasonable timeout like 3600 for 1 hour
+        )
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except asyncio.CancelledError:
+        logger.info("WebSocket connection cancelled during reload")
+        raise
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass  
+    
+    # Try to get session context from query parameters or headers
+    # session_id = websocket.query_params.get("session_id")
+    # call_connection_id = websocket.query_params.get("call_connection_id")
+    
+    # # Log WebSocket connection
+    # if session_id or call_connection_id:
+    #     await session_manager.log_event(
+    #         session_id=session_id,
+    #         call_connection_id=call_connection_id,
+    #         event_type="websocket_connected",
+    #         event_data={
+    #             "endpoint": "/realtime-acs",
+    #             "client_info": websocket.client.host if websocket.client else "unknown"
+    #         }
+    #     )
+    
+    # try:
+    #     await rtmt.forward_messages(websocket, is_acs_audio_stream=True)
+    # except Exception as e:
+    #     # Log WebSocket errors
+    #     if session_id or call_connection_id:
+    #         await session_manager.log_event(
+    #             session_id=session_id,
+    #             call_connection_id=call_connection_id,
+    #             event_type="websocket_error",
+    #             event_data={
+    #                 "error": str(e),
+    #                 "endpoint": "/realtime-acs"
+    #             }
+    #         )
+    #     raise
+    # finally:
+    #     # Log WebSocket disconnection
+    #     if session_id or call_connection_id:
+    #         await session_manager.log_event(
+    #             session_id=session_id,
+    #             call_connection_id=call_connection_id,
+    #             event_type="websocket_disconnected",
+    #             event_data={
+    #                 "endpoint": "/realtime-acs"
+    #             }
+    #         )
