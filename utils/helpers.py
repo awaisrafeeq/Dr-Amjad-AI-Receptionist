@@ -34,9 +34,9 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                 "output_audio_format": "pcm16",
                 "turn_detection": {
                     "type": 'server_vad',
-                    "threshold": 0.6,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 1000 # Increased from 500ms to give more time to talk
+                    "threshold": 0.4,
+                    "prefix_padding_ms": 500,
+                    "silence_duration_ms": 1500
                 },
                 "input_audio_transcription": {
                   "model": "whisper-1", 
@@ -155,8 +155,10 @@ def transform_openai_to_acs_format(msg_data: Any) -> Optional[Any]:
     # In this case, we don't want to send the unplayed audio buffer to the client anymore and clear the buffer audio.
     # Buffered audio is audio data that has been sent to Azure Communication Services, but not yet played by the client.
     if msg_data["type"] == "input_audio_buffer.speech_started":
-        logger.info("VAD detected: User started speaking")
-        acs_message = None
+        logger.info("VAD detected: User started speaking — flushing ACS audio buffer")
+        acs_message = {
+            "kind": "StopAudio"
+        }
 
     return acs_message
 

@@ -309,10 +309,15 @@ class RTMiddleTier:
                                     # Track response state to avoid response_cancel_not_active errors
                                     if event_type == "response.created":
                                         response_active = True
-                                        logger.debug("Response created - response_active=True")
-                                    elif event_type in ("response.done", "response.cancelled"):
+                                        suppress_agent_audio = False
+                                        cancel_sent_for_current_turn = False
+                                        last_user_activity_ts = loop.time()
+                                        logger.debug("Response created - response_active=True, flags reset")
+                                    elif event_type == "response.done":
                                         response_active = False
-                                        logger.debug("Response ended - response_active=False")
+                                        suppress_agent_audio = False
+                                        cancel_sent_for_current_turn = False
+                                        logger.debug("Response ended - response_active=False, flags reset")
                                     
                                     elif event_type == "session.updated":
                                         logger.info("[SESSION] OpenAI confirmed session.updated — transcription active")
