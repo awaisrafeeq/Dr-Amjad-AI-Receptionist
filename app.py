@@ -13,8 +13,21 @@ from utils.session_manager import session_manager
 
 
 # Setup logging to both console and file
-log_dir = os.path.join(os.path.dirname(__file__), "logs")
-os.makedirs(log_dir, exist_ok=True)
+# Use /home/logs for Azure App Service (persistent storage), fallback to /tmp/logs if not writable
+log_dir = "/home/logs" if os.path.exists("/home") else os.path.join(os.path.dirname(__file__), "logs")
+
+# Try to create the logs directory, fallback to /tmp/logs if it fails
+try:
+    os.makedirs(log_dir, exist_ok=True)
+    # Test if directory is writable
+    test_file = os.path.join(log_dir, ".write_test")
+    with open(test_file, "w") as f:
+        f.write("test")
+    os.remove(test_file)
+except (OSError, PermissionError, FileNotFoundError):
+    log_dir = "/tmp/logs"
+    os.makedirs(log_dir, exist_ok=True)
+    print(f"Warning: Could not use /home/logs, falling back to {log_dir}")
 
 log_file = os.path.join(log_dir, f"app_{datetime.now().strftime('%Y%m%d')}.log")
 

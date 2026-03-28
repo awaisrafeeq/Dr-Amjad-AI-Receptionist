@@ -217,6 +217,42 @@ class AzureStorageLogger:
             raise
             
     
+    async def get_transcriptions_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+        """
+        Retrieve all transcriptions for a specific session, sorted by timestamp.
+        
+        Args:
+            session_id: The session ID to query
+            
+        Returns:
+            List of transcription dictionaries sorted by timestamp
+        """
+        try:
+            container = await self.get_container('transcriptions')
+            
+            # Query for all transcriptions with this session ID
+            query = "SELECT * FROM c WHERE c.sessionId = @sessionId ORDER BY c.timestamp ASC"
+            parameters = [{"name": "@sessionId", "value": session_id}]
+            
+            transcriptions = []
+            async for item in container.query_items(
+                query=query,
+                parameters=parameters,
+                partition_key=session_id
+            ):
+                transcriptions.append({
+                    "speaker": item.get("speaker", "unknown"),
+                    "utterance_text": item.get("utterance_text", ""),
+                    "timestamp": item.get("timestamp", "")
+                })
+            
+            logger.info(f"Retrieved {len(transcriptions)} transcriptions for session {session_id}")
+            return transcriptions
+            
+        except Exception as e:
+            logger.error(f"Error retrieving transcriptions for session {session_id}: {e}")
+            return []
+
     async def close(self):
         """Close the cosmos service client."""
         if self._cosmos_service_client:

@@ -6,6 +6,7 @@ azure-core
 azure-eventgrid
 azure-storage-blob
 azure-communication-callautomation
+azure-communication-email
 python-dotenv
 websockets
 openai
@@ -16,3 +17,4 @@ PyPDF2
 python-multipart
 azure-cosmos
 langdetect
+uvloop

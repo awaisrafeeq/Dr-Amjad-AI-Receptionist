@@ -35,8 +35,8 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                 "turn_detection": {
                     "type": 'server_vad',
                     "threshold": 0.6,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 1000 # Increased from 500ms to give more time to talk
+                    "prefix_padding_ms": 200,
+                    "silence_duration_ms": 600
                 },
                 "input_audio_transcription": {
                   "model": "whisper-1", 
@@ -72,7 +72,7 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                     {
                         "type": "function",
                         "name": "book_appointment",
-                        "description": "Book an appointment for a patient. Use phonebook info for name/DOB if available. DO NOT ask for gender.",
+                        "description": "Book an appointment for a patient. Use phonebook info for name/DOB if available. DO NOT ask for gender. Determine appointment duration based on visit reason complexity (one issue=15min, two issues=20min, three+ issues/new patient=30min).",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -82,18 +82,28 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                                 "patient_last_name": {"type": "string"},
                                 "patient_dob": {"type": "string", "description": "Patient's Date of Birth in YYYY-MM-DD format."},
                                 "patient_phone": {"type": "string", "description": "Patient's phone number with country code (e.g. +41...)"},
-                                "patient_gender": {"type": "string", "enum": ["male", "female", "other"], "description": "Patient's gender (male, female, other). Default to 'other' or infer from voice. DO NOT ASK."},
-                                "patient_email": {"type": "string", "description": "Patient's email address (optional).", "default": ""},
+                                "patient_gender": {"type": "string", "enum": ["male", "female", "other"], "description": "Patient's gender. Detect automatically from the caller's voice (male vs female voice characteristics). Do NOT ask the patient. Use 'male' for clearly male voices, 'female' for clearly female voices, 'other' only when voice is completely ambiguous."},
+                                "patient_email": {"type": "string", "description": "Patient's email address for appointment confirmation. Ask the patient for it if not already known from the phonebook."},
                                 "street": {"type": "string", "description": "Patient's street name."},
                                 "street_number": {"type": "string", "description": "Patient's house/street number."},
                                 "zip_code": {"type": "string", "description": "Patient's zip code / postal code."},
                                 "city": {"type": "string", "description": "Patient's city."},
-                                "comment": {"type": "string", "description": "Reason for the appointment."}
+                                "visit_reason": {"type": "string", "description": "The reason for the visit as described by the patient. Used to determine appointment duration."},
+                                "comment": {"type": "string", "description": "Additional notes or comments for the appointment."}
                             },
                             "required": [
                                 "calendar_id", "slot_iso", "patient_first_name", "patient_last_name", 
-                                "patient_dob", "patient_phone", "street", "street_number", "zip_code", "city", "comment"
+                                "patient_dob", "patient_phone", "street", "street_number", "zip_code", "city", "visit_reason"
                             ]
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "get_available_doctors",
+                        "description": "Get the list of available doctors at MedCenter Volta. Returns all doctors with their names and German titles.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {}
                         }
                     },
                     {
@@ -213,3 +223,113 @@ def load_prompt_from_markdown(file_path):
         prompt = file.read()
     return prompt
 
+
+# --- Diagnosis Word Filter for TTS Output ---
+
+# List of diagnosis-related keywords and patterns to filter
+DIAGNOSIS_KEYWORDS = [
+    # Common medical conditions (German)
+    "diabetes", "diabetis", "bluthochdruck", "hypertonie", "bluthochdruck",
+    "asthma", "copd", "chronisch", "herzinfarkt", "schlaganfall", "krebs",
+    "tumor", "carcinom", "carcinoma", "metastas", "depression", "angst",
+    "psychose", "bipolar", "schizophrenie", "demenz", "alzheimer",
+    "parkinson", "epilepsie", "multipler sklerose", "ms", "rheuma",
+    "arthritis", "arthrose", "osteoporose", "gicht", "migräne",
+    "clusterkopfschmerz", "kopfschmerz", "schwindel", "tinitus",
+    "niereninsuffizienz", "leberzirrhose", "hepatitis", "zirrhose",
+    "bluthochdruck", "herzinsuffizienz", "koronare", "koronarsyndrom",
+    "ischämie", "thrombose", "embolie", "aneurysma", "varizen",
+    "gallensteine", "nierensteine", "prostata", "schilddrüsen",
+    "überfunktion", "unterfunktion", "hiv", "aids", "hepatitis",
+    
+    # Common medical conditions (English)
+    "diabetes", "hypertension", "asthma", "copd", "stroke", "heart attack",
+    "cancer", "tumor", "carcinoma", "metastasis", "depression", "anxiety",
+    "psychosis", "bipolar", "schizophrenia", "dementia", "alzheimer",
+    "parkinson", "epilepsy", "multiple sclerosis", "ms", "rheumatoid",
+    "arthritis", "osteoporosis", "gout", "migraine", "headache",
+    "vertigo", "tinnitus", "kidney failure", "cirrhosis", "hepatitis",
+    "coronary", "ischemia", "thrombosis", "embolism", "aneurysm",
+    "varicose", "gallstones", "kidney stones", "prostate", "thyroid",
+    "hyperthyroidism", "hypothyroidism", "hiv", "aids",
+]
+
+# ICD code patterns (e.g., A00-Z99, E11, I10, etc.)
+ICD_CODE_PATTERNS = [
+    r'\b[A-Z]\d{2}\b',           # A00, B99, etc.
+    r'\b[A-Z]\d{2}\.\d{1,2}\b',  # A00.0, E11.9, etc.
+    r'\bICD[\s-]?\d{0,2}\b',     # ICD, ICD-10, ICD10
+    r'\bICD[\s-]?\d{0,2}[-\s]?[A-Z]\d{2,4}\b',  # ICD-10-E11, ICD10 E11
+]
+
+# Sensitive data patterns
+SENSITIVE_PATTERNS = [
+    r'\bpatienten[-\s]?nr\.?\s*:?\s*\d+',  # Patienten-Nr: 12345
+    r'\bversicherten[-\s]?nr\.?\s*:?\s*\d+',  # Versicherten-Nr
+    r'\bkv[-\s]?nr\.?\s*:?\s*\d+',  # KV-Nr
+    r'\bmatrikel[-\s]?nr\.?\s*:?\s*\d+',  # Matrikel-Nr
+]
+
+# Compile regex patterns
+import re
+ICD_REGEX = [re.compile(pattern, re.IGNORECASE) for pattern in ICD_CODE_PATTERNS]
+SENSITIVE_REGEX = [re.compile(pattern, re.IGNORECASE) for pattern in SENSITIVE_PATTERNS]
+
+
+def filter_diagnosis_words(text: str) -> tuple[str, bool]:
+    """
+    Filter diagnosis words, ICD codes, and sensitive medical information from text.
+    
+    Args:
+        text: Input text to filter
+        
+    Returns:
+        Tuple of (filtered_text, was_filtered)
+    """
+    if not text:
+        return text, False
+    
+    original_text = text
+    was_filtered = False
+    text_lower = text.lower()
+    
+    # Check for diagnosis keywords
+    for keyword in DIAGNOSIS_KEYWORDS:
+        if keyword in text_lower:
+            was_filtered = True
+            break
+    
+    # Check for ICD codes
+    if not was_filtered:
+        for pattern in ICD_REGEX:
+            if pattern.search(text):
+                was_filtered = True
+                break
+    
+    # Check for sensitive patterns
+    if not was_filtered:
+        for pattern in SENSITIVE_REGEX:
+            if pattern.search(text):
+                was_filtered = True
+                break
+    
+    # If filtered, return safe fallback message
+    if was_filtered:
+        # Log the filtering (but don't expose the filtered content)
+        logger = logging.getLogger(__name__)
+        logger.warning(f"[DIAGNOSIS_FILTER] Filtered content detected and blocked from TTS")
+        
+        # Return a safe German fallback
+        return "Diese Information kann ich telefonisch nicht weitergeben.", True
+    
+    return original_text, False
+
+
+# Export for use in other modules
+__all__ = [
+    'transform_acs_to_openai_format',
+    'transform_openai_to_acs_format', 
+    'extract_transcription_from_openai_message',
+    'load_prompt_from_markdown',
+    'filter_diagnosis_words',
+]

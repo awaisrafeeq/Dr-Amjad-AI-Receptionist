@@ -23,7 +23,7 @@ caller = acs_caller
 # --- Setup OpenAI Realtime bridge ---
 rtmt = rtmt
 
-session_id = None
+# session_id = None  # REMOVED GLOBAL SESSION ID
 
 @router.post("/acs/incoming", tags=['ACS Call Events'])
 async def inbound_call(request: Request):
@@ -57,22 +57,49 @@ async def inbound_call(request: Request):
                     caller_id = event.data["from"]["rawId"]
                 logger.info(f"Incoming call answered from: {caller_id}")
                 
-                guid = uuid.uuid4()
-                query_parameters = urlencode({"callerId": caller_id})
-                callback_uri = f"{caller.acs_callback_path}/{guid}?{query_parameters}"
-                logger.info("callback url: %s", callback_uri)
-                
-                await caller.answer_inbound_call(incoming_call_context, callback_uri)
+                # --- PHONEBOOK LOOKUP: Check if caller is known ---
+                phonebook_match = None
+                matched_caller = False
+                try:
+                    from utils.phonebook_lookup import get_phonebook_lookup
+                    lookup = get_phonebook_lookup()
+                    if lookup:
+                        phonebook_match = lookup.lookup_by_phone(caller_id)
+                        if phonebook_match:
+                            matched_caller = True
+                            logger.info(f"[PHONEBOOK] Caller matched: {phonebook_match.first_name} {phonebook_match.last_name}")
+                        else:
+                            logger.info(f"[PHONEBOOK] No match found for caller: {caller_id}")
+                except Exception as pb_error:
+                    logger.warning(f"[PHONEBOOK] Error during lookup: {pb_error}")
+                # --- END PHONEBOOK LOOKUP ---
                 
                 # create a new session ID for this call
-                global session_id
                 try:
                     event_payload = event.data
                     if isinstance(event_payload, str):
                         event_payload = json.loads(event_payload)
-                    session_id = await session_manager.create_session(event_payload, event.event_type)
+                    
+                    # Add phonebook match info to session data
+                    session_data = {
+                        **event_payload,
+                        "matched_caller": matched_caller,
+                        "phonebook_info": phonebook_match.to_dict() if phonebook_match else None
+                    }
+                    
+                    session_id = await session_manager.create_session(session_data, event.event_type)
+                    # Use session_id as the guid for the callback URL
+                    guid = session_id
                 except Exception as session_error:
                     logger.error(f"Session creation error (non-fatal): {session_error}")
+                    guid = uuid.uuid4()
+                    session_id = str(guid)
+                
+                query_parameters = urlencode({"callerId": caller_id})
+                callback_uri = f"{caller.acs_callback_path}/{guid}?{query_parameters}"
+                logger.info("callback url: %s", callback_uri)
+                
+                await caller.answer_inbound_call(incoming_call_context, callback_uri, session_id)
                 
                 return Response(status_code=200)
             
@@ -84,7 +111,7 @@ async def inbound_call(request: Request):
                 "details": str(e),
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
-            if session_id:
+            if 'session_id' in locals():
                 await session_manager.log_event(
                     session_id=session_id,
                     event_data=event
@@ -102,6 +129,7 @@ async def handle_callback(contextId: str, request: Request):
     """
     try:
         callbacks = await request.json()
+        current_session_id = contextId # session_id was used as contextId/guid
         caller_id = request.query_params.get("callerId", "").strip()
         
         if "+" not in caller_id and caller_id:
@@ -128,7 +156,7 @@ async def handle_callback(contextId: str, request: Request):
                 generic_event["details"]["operationContext"] = event.data.get("operationContext")
                 
                 await session_manager.log_event(
-                    session_id=session_id,
+                    session_id=current_session_id,
                     event_data=generic_event
                 )
             
@@ -137,7 +165,7 @@ async def handle_callback(contextId: str, request: Request):
                 generic_event["details"]["sequenceNumber"] = event.data.get("sequenceNumber")
                 
                 await session_manager.log_event(
-                    session_id=session_id,
+                    session_id=current_session_id,
                     event_data=generic_event
                 )
                 
@@ -161,7 +189,7 @@ async def handle_callback(contextId: str, request: Request):
                 generic_event["details"]["mediaStreamingUpdate"] = event.data.get("mediaStreamingUpdate")
                 
                 await session_manager.log_event(
-                    session_id=session_id,
+                    session_id=current_session_id,
                     event_data=generic_event
                 )
                 
@@ -169,7 +197,7 @@ async def handle_callback(contextId: str, request: Request):
                 generic_event["details"]["mediaStreamingUpdate"] = event.data.get("mediaStreamingUpdate")
                 
                 await session_manager.log_event(
-                    session_id=session_id,
+                    session_id=current_session_id,
                     event_data=generic_event
                 )
                 
@@ -178,7 +206,7 @@ async def handle_callback(contextId: str, request: Request):
                 generic_event["status"] = 'error'
                 
                 await session_manager.log_event(
-                    session_id=session_id,
+                    session_id=current_session_id,
                     event_data=generic_event
                 )
                 
@@ -187,12 +215,20 @@ async def handle_callback(contextId: str, request: Request):
                 generic_event["details"]["resultInformation"] = event.data.get("resultInformation")
                 generic_event["status"] = 'disconnected'
                 
-                
                 # End the session
                 await session_manager.end_session(
-                    session_id=session_id,
+                    session_id=contextId,
                     event_data=generic_event
                 )
+                
+                # Send transcript email
+                try:
+                    await session_manager.send_transcript_email(
+                        session_id=contextId,
+                        caller_phone=caller_id if 'caller_id' in locals() else None
+                    )
+                except Exception as email_error:
+                    logger.error(f"Error sending transcript email: {email_error}")
 
 
     except Exception as ex:
@@ -203,7 +239,7 @@ async def handle_callback(contextId: str, request: Request):
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
         await session_manager.log_event(
-            session_id=session_id,
+            session_id=current_session_id,
             event_data=event
         )
     return Response(status_code=200)   
@@ -213,13 +249,15 @@ async def websocket_handler_acs(websocket: WebSocket):
     """Handles ACS <-> OpenAI Realtime audio streaming."""
     await websocket.accept()
     
-    # Try to get session context from query parameters or headers
-    # ws_session_id = websocket.query_params.get("session_id")
+    # Get session_id from query parameters
+    current_session_id = websocket.query_params.get("session_id")
+    if not current_session_id:
+        logger.warning("WebSocket connected without session_id query parameter!")
     
     try:
         # Add a timeout to prevent hanging connections
         await asyncio.wait_for(
-            rtmt.forward_messages(websocket, is_acs_audio_stream=True, session_id=session_id),
+            rtmt.forward_messages(websocket, is_acs_audio_stream=True, session_id=current_session_id),
             timeout=None  # You can set a reasonable timeout like 3600 for 1 hour
         )
     except WebSocketDisconnect:

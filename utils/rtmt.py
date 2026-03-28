@@ -4,7 +4,7 @@ import json
 from json import JSONDecodeError
 from typing import Any, Optional, List, Dict, Tuple
 from fastapi import WebSocket
-from utils.helpers import transform_acs_to_openai_format, transform_openai_to_acs_format, load_prompt_from_markdown, extract_transcription_from_openai_message
+from utils.helpers import transform_acs_to_openai_format, transform_openai_to_acs_format, load_prompt_from_markdown, extract_transcription_from_openai_message, filter_diagnosis_words
 from config import get_config
 import asyncio
 import logging
@@ -22,7 +22,11 @@ except Exception:  # pragma: no cover
 
 import os
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 config = get_config()
 logger = logging.getLogger(__name__)
@@ -74,6 +78,7 @@ class RTMiddleTier:
 
                     last_user_activity_ts = loop.time()
                     last_prompt_stage = 0
+                    detected_conversation_language: Optional[str] = None
 
                     last_kb_context: Optional[str] = None
 
@@ -92,11 +97,13 @@ class RTMiddleTier:
                             return None
 
                     async def maybe_update_kb_context(user_text: str) -> None:
-                        nonlocal last_kb_context
+                        nonlocal last_kb_context, detected_conversation_language
                         if not user_text:
                             return
 
                         user_lang = _detect_language(user_text)
+                        if user_lang:
+                            detected_conversation_language = user_lang
 
                         try:
                             results = await document_processor.search_knowledge_base(
@@ -196,7 +203,6 @@ class RTMiddleTier:
                             logger.warning("Timed out waiting for session initialization; greeting may not be sent")
                             return
 
-
                         try:
                             await asyncio.wait_for(session_confirmed.wait(), timeout=2)
                             logger.info("Session confirmed by OpenAI, sending greeting")
@@ -206,10 +212,45 @@ class RTMiddleTier:
                         if greeting_sent.is_set():
                             return
 
-                        await send_assistant_prompt(
-                            "Start the call now with the default German greeting from the system instructions. "
-                            "Do not mention internal policies. After greeting, ask how you can help."
-                        )
+                        # --- HARDCODED OPENING GREETING ---
+                        # Send the exact German greeting as the first utterance
+                        hardcoded_greeting = "MedCenter Volta, Sie sprechen mit Kaya, der digitalen Assistentin. Wie kann ich Ihnen behilflich sein?"
+                        
+                        try:
+                            await target_ws.send_str(
+                                json.dumps({
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [
+                                            {
+                                                "type": "input_text",
+                                                "text": hardcoded_greeting
+                                            }
+                                        ]
+                                    }
+                                })
+                            )
+                            # Trigger the response to speak the greeting
+                            await target_ws.send_str(
+                                json.dumps({
+                                    "type": "response.create",
+                                    "response": {
+                                        "modalities": ["audio", "text"],
+                                        "voice": "shimmer"
+                                    }
+                                })
+                            )
+                            logger.info("[GREETING] Hardcoded German opening sent")
+                        except Exception as e:
+                            logger.error(f"[GREETING] Failed to send hardcoded greeting: {e}")
+                            # Fallback to assistant prompt method
+                            await send_assistant_prompt(
+                                "Start the call now with the default German greeting from the system instructions. "
+                                "Do not mention internal policies. After greeting, ask how you can help."
+                            )
+                        
                         greeting_sent.set()
                         logger.info("Initial greeting trigger sent")
 
@@ -219,9 +260,9 @@ class RTMiddleTier:
                             return
 
                         # Silence policy (seconds)
-                        prompt_1_after = 60  # Increased from 30s
-                        prompt_2_after = 120 # Increased from 60s
-                        hangup_after = 300   # Increased from 120s
+                        prompt_1_after = 90  # Increased from 60s
+                        prompt_2_after = 180 # Increased from 120s
+                        hangup_after = 360   # Increased from 300s
 
                         try:
                             while not call_end_requested.is_set():
@@ -261,6 +302,7 @@ class RTMiddleTier:
                             logger.exception("Inactivity monitor failed")
                             return
                     async def from_client_to_server():
+                        nonlocal session_id
                         try:
                             async for msg in ws.iter_text():
                                 try:
@@ -270,7 +312,17 @@ class RTMiddleTier:
                                     continue
 
                                 if isinstance(data, dict):
-                                    logger.debug("ACS -> received kind: %s", data.get("kind"))
+                                    kind = data.get("kind")
+                                    logger.debug("ACS -> received kind: %s", kind)
+                                    
+                                    # If session_id is not known yet, try to resolve it from metadata
+                                    if not session_id and kind == "metadata":
+                                        call_conn_id = data.get("metadata", {}).get("callConnectionId")
+                                        if call_conn_id:
+                                            session_obj = session_manager.get_session_by_call_connection_id(call_conn_id)
+                                            if session_obj:
+                                                session_id = session_obj.session_id
+                                                logger.info(f"Resolved session_id {session_id} from callConnectionId {call_conn_id}")
 
                                 if is_acs_audio_stream:
                                     data = transform_acs_to_openai_format(data, self.model, self.system_message, self.temperature, self.max_tokens, self.disable_audio, self.selected_voice)
@@ -285,9 +337,15 @@ class RTMiddleTier:
                             logger.exception("Error in client to server forwarding")
                             return
                             
+                    # --- TURN DETECTION CONFIGURATION ---
+                    # Delay after speech stops before AI can respond (seconds)
+                    TURN_DETECTION_DELAY = 0.5  # 300ms delay to prevent interrupting
+                    speech_stop_time = 0.0
+                    # --- END TURN DETECTION CONFIG ---
+
                     async def from_server_to_client():
-                        nonlocal last_user_activity_ts, last_prompt_stage
-                        nonlocal suppress_agent_audio, cancel_sent_for_current_turn, response_active
+                        nonlocal last_user_activity_ts, last_prompt_stage, session_id
+                        nonlocal suppress_agent_audio, cancel_sent_for_current_turn, response_active, speech_stop_time
                         try:
                             async for msg in target_ws:
                                 if msg.type == aiohttp.WSMsgType.TEXT:
@@ -320,156 +378,372 @@ class RTMiddleTier:
 
                                     elif event_type == "response.function_call_arguments.done":
                                         logger.info(f"[FUNCTION CALL] Received: {original_data}")
-                                        call_id = original_data.get("call_id")
-                                        func_name = original_data.get("name")
+                                        _call_id = original_data.get("call_id")
+                                        _func_name = original_data.get("name")
                                         try:
-                                            args = json.loads(original_data.get("arguments", "{}"))
+                                            _fn_args = json.loads(original_data.get("arguments", "{}"))
                                         except json.JSONDecodeError:
-                                            args = {}
-                                            
-                                        result = ""
-                                        
-                                        if func_name == "get_available_doctors":
-                                            doctors = []
-                                            try:
-                                                calendars = await epaad_client.get_calendars()
-                                                for cal in calendars or []:
-                                                    prof = cal.get("professional") or {}
-                                                    first = (prof.get("firstName") or "").strip()
-                                                    last = (prof.get("lastName") or "").strip()
-                                                    name = f"Dr. {first} {last}".strip() or "Unknown Doctor"
+                                            _fn_args = {}
+
+                                        # Run all API work in a background task so the event loop stays
+                                        # unblocked — audio frames from OpenAI continue to be forwarded
+                                        # to ACS while the function executes, eliminating silence gaps.
+                                        async def _run_function_call(__call_id, __func_name, __args):
+                                            __result = ""
+
+                                            # Send brief holding message for slow functions so caller never hears silence
+                                            if __func_name in ("get_available_slots", "book_appointment", "get_available_doctors"):
+                                                await asyncio.sleep(0.15)  # yield so response.done is processed first
+                                                if not response_active:
                                                     try:
-                                                        doctors.append({"calendar_id": int(cal.get("id")), "doctor_name": name})
-                                                    except Exception:
-                                                        pass
-                                                
-                                                extra = (os.getenv("EPAAD_EXTRA_CALENDAR_IDS") or "").strip()
-                                                if extra:
-                                                    for part in extra.split(","):
-                                                        if part.strip():
-                                                            try:
-                                                                cal_id = int(part.strip())
-                                                                if not any(d["calendar_id"] == cal_id for d in doctors):
-                                                                    doctors.append({"calendar_id": cal_id, "doctor_name": f"Unknown Doctor (Calendar {cal_id})"})
-                                                            except Exception:
-                                                                pass
-                                                                
-                                                result = json.dumps(doctors)
-                                            except Exception as e:
-                                                logger.error(f"Error in get_available_doctors: {e}")
-                                                result = json.dumps({"error": str(e)})
-                                                
-                                        elif func_name == "get_available_slots":
-                                            try:
-                                                cal_id = args.get("calendar_id")
-                                                target_date_str = args.get("date")
-                                                tod = args.get("time_of_day", "any")
-                                                target_day = date.fromisoformat(target_date_str)
-                                                start_dt = datetime.combine(target_day, datetime.min.time())
-                                                end_dt = datetime.combine(target_day, datetime.max.time()).replace(microsecond=0)
-                                                
-                                                events = await epaad_client.get_events(
-                                                    calendar_id=cal_id,
-                                                    from_dt=start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                                                    until_dt=end_dt.strftime("%Y-%m-%dT%H:%M:%S")
-                                                )
-                                                
-                                                slots = compute_free_slots(
-                                                    events=events or [],
-                                                    target_date=target_day,
-                                                    opening_hours=default_opening_hours(),
-                                                    slot_minutes=15,
-                                                    time_of_day=tod,
-                                                    now_dt=datetime.now(),
-                                                )
-                                                
-                                                slot_iso = [s.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S") for s in slots][:10]
-                                                result = json.dumps({"available_slots": slot_iso})
-                                            except Exception as e:
-                                                logger.error(f"Error in get_available_slots: {e}")
-                                                result = json.dumps({"error": str(e)})
-                                                
-                                        elif func_name == "book_appointment":
-                                            try:
-                                                dob = args.get("patient_dob", "")
-                                                if len(dob) == 10:
-                                                    dob += "T00:00:00"
+                                                        await target_ws.send_str(json.dumps({
+                                                            "type": "response.create",
+                                                            "response": {
+                                                                "modalities": ["audio", "text"],
+                                                                "tool_choice": "none",
+                                                                "instructions": (
+                                                                    "Say ONE brief sentence in the same language as the caller. "
+                                                                    "German: 'Einen Moment bitte, ich prüfe das kurz für Sie nach.' "
+                                                                    "English: 'One moment please, let me check that for you.' "
+                                                                    "Say ONLY this one sentence. Do NOT call any function tools."
+                                                                )
+                                                            }
+                                                        }))
+                                                        logger.info(f"[HOLDING] Sent holding message for {__func_name}")
+                                                    except Exception as __he:
+                                                        logger.debug(f"[HOLDING] Could not send holding message: {__he}")
 
-                                                phone = args.get("patient_phone")
+                                            if __func_name == "get_available_doctors":
+                                                __doctors = []
+                                                try:
+                                                    __calendars = await epaad_client.get_calendars()
+                                                    for __cal in __calendars or []:
+                                                        __prof = __cal.get("professional") or {}
+                                                        __first = (__prof.get("firstName") or "").strip()
+                                                        __last = (__prof.get("lastName") or "").strip()
+                                                        __name = f"Dr. {__first} {__last}".strip() or "Unknown Doctor"
+                                                        try:
+                                                            __doctors.append({"calendar_id": int(__cal.get("id")), "doctor_name": __name})
+                                                        except Exception:
+                                                            pass
 
-                                                event = {
-                                                    "startDateTime": args.get("slot_iso"),
-                                                    "comment": args.get("comment") or "AI Booking",
-                                                    "patient": {
-                                                        "firstName": args.get("patient_first_name"),
-                                                        "lastName": args.get("patient_last_name"),
-                                                        "birthDate": dob,
-                                                        "gender": args.get("patient_gender", "other"),
-                                                        "address": {
-                                                            "street": args.get("street", ""),
-                                                            "streetNumber": args.get("street_number", ""),
-                                                            "zipCode": args.get("zip_code", ""),
-                                                            "city": args.get("city", ""),
-                                                            "state": "",
-                                                            "country": "CH"  # Default to Switzerland as per test scripts
-                                                        },
-                                                        "privatePhoneNumber": phone,
-                                                        "mobilePhoneNumber": phone,
-                                                        "email": args.get("patient_email", "")
+                                                    __extra = (os.getenv("EPAAD_EXTRA_CALENDAR_IDS") or "").strip()
+                                                    if __extra:
+                                                        for __part in __extra.split(","):
+                                                            if __part.strip():
+                                                                try:
+                                                                    __cal_id = int(__part.strip())
+                                                                    if not any(__d["calendar_id"] == __cal_id for __d in __doctors):
+                                                                        __doctors.append({"calendar_id": __cal_id, "doctor_name": f"Unknown Doctor (Calendar {__cal_id})"})
+                                                                except Exception:
+                                                                    pass
+
+                                                    __result = json.dumps(__doctors)
+                                                except Exception as __e:
+                                                    logger.error(f"Error in get_available_doctors: {__e}")
+                                                    __result = json.dumps({"error": str(__e)})
+
+                                            elif __func_name == "get_available_slots":
+                                                try:
+                                                    __cal_id = __args.get("calendar_id")
+                                                    __target_date_str = __args.get("date")
+                                                    __tod = __args.get("time_of_day", "any")
+                                                    __target_day = date.fromisoformat(__target_date_str)
+                                                    __start_dt = datetime.combine(__target_day, datetime.min.time())
+                                                    __end_dt = datetime.combine(__target_day, datetime.max.time()).replace(microsecond=0)
+
+                                                    __events = await epaad_client.get_events(
+                                                        calendar_id=__cal_id,
+                                                        from_dt=__start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                                                        until_dt=__end_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                                                    )
+
+                                                    __slots = compute_free_slots(
+                                                        events=__events or [],
+                                                        target_date=__target_day,
+                                                        opening_hours=default_opening_hours(),
+                                                        slot_minutes=15,
+                                                        time_of_day=__tod,
+                                                        now_dt=datetime.now(ZoneInfo("Europe/Zurich")),
+                                                    )
+
+                                                    __slot_iso = [__s.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S") for __s in __slots][:10]
+                                                    __result = json.dumps({"available_slots": __slot_iso})
+                                                except Exception as __e:
+                                                    logger.error(f"Error in get_available_slots: {__e}")
+                                                    __result = json.dumps({"error": str(__e)})
+
+                                            elif __func_name == "book_appointment":
+                                                try:
+                                                    __dob = __args.get("patient_dob", "")
+                                                    if len(__dob) == 10:
+                                                        __dob += "T00:00:00"
+
+                                                    __phone = __args.get("patient_phone")
+                                                    __visit_reason = __args.get("visit_reason", "")
+                                                    __comment = __args.get("comment", "")
+
+                                                    # --- APPOINTMENT TYPE SELECTION LOGIC ---
+                                                    __appointment_type_id = 61
+                                                    __visit_lower = __visit_reason.lower() if __visit_reason else ""
+                                                    __comment_lower = __comment.lower() if __comment else ""
+                                                    __combined_text = __visit_lower + " " + __comment_lower
+
+                                                    __issue_indicators = [
+                                                        "und", "and", "sowie", "auch", "außerdem", "zusätzlich",
+                                                        "another", "other", "also", "plus", "besides", "moreover"
+                                                    ]
+                                                    __issue_count = sum(1 for __ind in __issue_indicators if __ind in __combined_text)
+
+                                                    __new_patient_keywords = [
+                                                        "neu", "new patient", "newly", "erstmalig", "neupatient",
+                                                        "erstbesuch", "first visit", "neu bei", "new to"
+                                                    ]
+                                                    __is_new_patient = any(__kw in __combined_text for __kw in __new_patient_keywords)
+
+                                                    __referral_keywords = [
+                                                        "überweisung", "referral", "überwiesen", "referred",
+                                                        "zuweisung", "zuweisender", "transfer"
+                                                    ]
+                                                    __is_referred = any(__kw in __combined_text for __kw in __referral_keywords)
+
+                                                    if __is_new_patient or __is_referred or __issue_count >= 2:
+                                                        __appointment_type_id = 65
+                                                        logger.info(f"[BOOKING] Selected appointment type 65 (30 min)")
+                                                    elif __issue_count == 1:
+                                                        __appointment_type_id = 63
+                                                        logger.info(f"[BOOKING] Selected appointment type 63 (20 min)")
+                                                    else:
+                                                        __appointment_type_id = 61
+                                                        logger.info(f"[BOOKING] Selected appointment type 61 (15 min)")
+                                                    # --- END APPOINTMENT TYPE SELECTION ---
+
+                                                    __f_name = __args.get("patient_first_name")
+                                                    __l_name = __args.get("patient_last_name")
+                                                    if __f_name == "[REDACTED]" or __l_name == "[REDACTED]":
+                                                        logging.getLogger("utils.rtmt").warning(f"[BOOKING WARN] Model sent [REDACTED] for name.")
+
+                                                    # Map gender: prefer AI-detected voice gender, then phonebook fallback
+                                                    __gender = (__args.get("patient_gender") or "").lower()
+                                                    if __gender not in ["male", "female"]:
+                                                        __gender = "other"
+                                                        try:
+                                                            __caller_session = session_manager.active_sessions.get(session_id)
+                                                            __caller_phone = __caller_session.participants[0]["phone_number"] if __caller_session and __caller_session.participants else None
+                                                            if __caller_phone:
+                                                                from utils.phonebook_lookup import get_phonebook_lookup
+                                                                __pb_lookup = get_phonebook_lookup()
+                                                                if __pb_lookup:
+                                                                    __pb_match = __pb_lookup.lookup_by_phone(__caller_phone)
+                                                                    if __pb_match and __pb_match.gender:
+                                                                        __g = __pb_match.gender.strip().lower()
+                                                                        if __g in ("m", "männlich", "male", "maennlich"):
+                                                                            __gender = "male"
+                                                                        elif __g in ("w", "f", "weiblich", "female", "frau"):
+                                                                            __gender = "female"
+                                                                        logger.info(f"[GENDER] Inferred '{__gender}' from phonebook Geschlecht='{__pb_match.gender}'")
+                                                        except Exception as __ge:
+                                                            logger.warning(f"[GENDER] Phonebook gender lookup failed: {__ge}")
+
+                                                    __city = __args.get("city", "")
+                                                    __state = "BS" if "basel" in __city.lower() else ""
+
+                                                    __full_comment = __visit_reason
+                                                    if __comment and __comment != __visit_reason:
+                                                        __full_comment = f"{__visit_reason} | {__comment}"
+
+                                                    __event = {
+                                                        "startDateTime": __args.get("slot_iso"),
+                                                        "epaad_appointmenttype_id": __appointment_type_id,
+                                                        "comment": __full_comment or "AI Booking",
+                                                        "patient": {
+                                                            "firstName": __f_name,
+                                                            "lastName": __l_name,
+                                                            "birthDate": __dob,
+                                                            "gender": __gender,
+                                                            "address": {
+                                                                "street": __args.get("street", ""),
+                                                                "streetNumber": __args.get("street_number", ""),
+                                                                "zipCode": __args.get("zip_code", ""),
+                                                                "city": __city,
+                                                                "state": __state,
+                                                                "country": "CH"
+                                                            },
+                                                            "privatePhoneNumber": __phone,
+                                                            "mobilePhoneNumber": __phone,
+                                                            "email": __args.get("patient_email", "")
+                                                        }
                                                     }
-                                                }
-                                                res = await epaad_client.create_event(args.get("calendar_id"), event)
-                                                onedoc_key = res.get("onedoc_key") or res.get("onedocKey") or res.get("key") if isinstance(res, dict) else None
-                                                if onedoc_key:
-                                                    logger.info(f"[BOOKING SUCCESS] Slot: {args.get('slot_iso')}, Reference: {onedoc_key}")
-                                                    result = json.dumps({"status": "success", "booking_reference": onedoc_key})
-                                                else:
-                                                    result = json.dumps({"status": "success", "message": "Appointment booked but no reference generated."})
-                                            except Exception as e:
-                                                logger.error(f"Error in book_appointment: {e}")
-                                                result = json.dumps({"status": "error", "message": str(e)})
+                                                    __res = await epaad_client.create_event(__args.get("calendar_id"), __event)
+                                                    __onedoc_key = __res.get("onedoc_key") or __res.get("onedocKey") or __res.get("key") if isinstance(__res, dict) else None
+                                                    if __onedoc_key:
+                                                        logger.info(f"[BOOKING SUCCESS] Slot: {__args.get('slot_iso')}, Reference: {__onedoc_key}")
+                                                        __result = json.dumps({"status": "success", "booking_reference": __onedoc_key, "instruction": "DO NOT speak the booking_reference to the caller."})
 
-                                        elif func_name == "terminate_call":
-                                            logger.info("AI requested to terminate call.")
-                                            call_end_requested.set()
-                                            result = json.dumps({"status": "success", "message": "Terminating call now."})
+                                                        # --- PHONEBOOK INTEGRATION (fire-and-forget) ---
+                                                        async def _phonebook_update():
+                                                            try:
+                                                                from utils.phonebook_lookup import get_phonebook_lookup, save_phonebook_to_blob
+                                                                __lookup = get_phonebook_lookup()
+                                                                if __lookup:
+                                                                    __existing = __lookup.lookup_by_phone(__phone)
+                                                                    if not __existing:
+                                                                        # Gender: M / W for phonebook format
+                                                                        __pb_gender = "M" if __gender == "male" else ("W" if __gender == "female" else "")
 
-                                        # Send function output back to the server
-                                        await target_ws.send_str(json.dumps({
-                                            "type": "conversation.item.create",
-                                            "item": {
-                                                "type": "function_call_output",
-                                                "call_id": call_id,
-                                                "output": result
-                                            }
-                                        }))
-                                        
-                                        # Trigger agent to respond (if not terminating)
-                                        if not call_end_requested.is_set():
+                                                                        # Date: MM/DD/YYYY for phonebook format
+                                                                        __birth_raw = __dob[:10] if __dob else ""
+                                                                        if __birth_raw:
+                                                                            try:
+                                                                                __bd_obj = datetime.strptime(__birth_raw, "%Y-%m-%d")
+                                                                                __birth_fmt = __bd_obj.strftime("%m/%d/%Y")
+                                                                            except Exception:
+                                                                                __birth_fmt = __birth_raw
+                                                                        else:
+                                                                            __birth_fmt = ""
+
+                                                                        # Language: ISO code -> German name
+                                                                        __lang_map = {
+                                                                            "de": "Deutsch", "en": "Englisch", "fr": "Französisch",
+                                                                            "it": "Italienisch", "sq": "Albanisch", "tr": "Türkisch",
+                                                                            "ar": "Arabisch", "ru": "Russisch", "es": "Spanisch",
+                                                                            "pt": "Portugiesisch", "pl": "Polnisch", "hr": "Kroatisch",
+                                                                            "sr": "Serbisch", "bs": "Bosnisch", "ro": "Rumänisch",
+                                                                            "nl": "Niederländisch", "uk": "Ukrainisch",
+                                                                            "ko": "Koreanisch", "zh": "Chinesisch", "ja": "Japanisch",
+                                                                            "fa": "Persisch", "ku": "Kurdisch", "so": "Somali",
+                                                                        }
+                                                                        __pb_lang = __lang_map.get(detected_conversation_language or "de", "Deutsch")
+
+                                                                        # Address: combine street + number
+                                                                        __st = __args.get("street", "")
+                                                                        __st_no = __args.get("street_number", "")
+                                                                        __pb_address = f"{__st} {__st_no}".strip() if __st else __st_no
+
+                                                                        __patient_data = {
+                                                                            "first_name": __f_name,
+                                                                            "last_name": __l_name,
+                                                                            "birth_date": __birth_fmt,
+                                                                            "phone": __phone,
+                                                                            "gender": __pb_gender,
+                                                                            "email": __args.get("patient_email", ""),
+                                                                            "zip_code": __args.get("zip_code", ""),
+                                                                            "city": __args.get("city", ""),
+                                                                            "address": __pb_address,
+                                                                            "doctor": "",
+                                                                            "comment": __args.get("comment") or "AI Booking",
+                                                                            "language": __pb_lang,
+                                                                        }
+                                                                        try:
+                                                                            __cals = await epaad_client.get_calendars()
+                                                                            for __c in __cals or []:
+                                                                                if int(__c.get("id")) == int(__args.get("calendar_id")):
+                                                                                    __p = __c.get("professional") or {}
+                                                                                    __pf = (__p.get("firstName") or "").strip()
+                                                                                    __pl = (__p.get("lastName") or "").strip()
+                                                                                    __patient_data["doctor"] = f"Dr. {__pf} {__pl}".strip() if (__pf or __pl) else ""
+                                                                                    break
+                                                                        except Exception:
+                                                                            pass
+                                                                        __added = __lookup.add_patient(__patient_data)
+                                                                        if __added:
+                                                                            __uploaded = save_phonebook_to_blob(__lookup.xlsx_path)
+                                                                            if __uploaded:
+                                                                                logger.info(f"[PHONEBOOK] New patient {__f_name} {__l_name} added and uploaded")
+                                                                            else:
+                                                                                logger.warning(f"[PHONEBOOK] Patient added locally but blob upload failed")
+                                                                        else:
+                                                                            logger.warning(f"[PHONEBOOK] Failed to add patient to phonebook")
+                                                                    else:
+                                                                        logger.info(f"[PHONEBOOK] Patient {__f_name} {__l_name} already exists")
+                                                            except Exception as __pe:
+                                                                logger.warning(f"[PHONEBOOK] Error during phonebook integration: {__pe}")
+                                                        asyncio.create_task(_phonebook_update())
+                                                        # --- END PHONEBOOK INTEGRATION ---
+
+                                                    else:
+                                                        __result = json.dumps({"status": "success", "message": "Appointment booked but no reference generated."})
+                                                except Exception as __e:
+                                                    logger.error(f"Error in book_appointment: {__e}")
+                                                    __result = json.dumps({"status": "error", "message": str(__e)})
+
+                                            elif __func_name == "terminate_call":
+                                                logger.info("AI requested to terminate call.")
+                                                call_end_requested.set()
+                                                __result = json.dumps({"status": "success", "message": "Terminating call now."})
+
+                                            # Wait for any active holding response to finish before submitting function output
+                                            if __func_name != "terminate_call":
+                                                __resp_wait = 0.0
+                                                while response_active and __resp_wait < 12.0:
+                                                    await asyncio.sleep(0.2)
+                                                    __resp_wait += 0.2
+
+                                            # Submit function output back to OpenAI
                                             await target_ws.send_str(json.dumps({
-                                                "type": "response.create"
+                                                "type": "conversation.item.create",
+                                                "item": {
+                                                    "type": "function_call_output",
+                                                    "call_id": __call_id,
+                                                    "output": __result
+                                                }
                                             }))
+
+                                            # Trigger agent to respond (if not terminating)
+                                            if not call_end_requested.is_set():
+                                                await target_ws.send_str(json.dumps({
+                                                    "type": "response.create"
+                                                }))
+
+                                        asyncio.create_task(_run_function_call(_call_id, _func_name, _fn_args))
 
                                     if event_type == "input_audio_buffer.speech_started":
                                         last_user_activity_ts = loop.time()
                                         last_prompt_stage = 0
                                         suppress_agent_audio = True
 
-                                        if not cancel_sent_for_current_turn and response_active:
+                                        # Always try to cancel — removed "and response_active" to avoid
+                                        # race conditions where response_active is briefly False
+                                        if not cancel_sent_for_current_turn:
                                             cancel_sent_for_current_turn = True
                                             try:
                                                 await target_ws.send_str(json.dumps({"type": "response.cancel"}))
                                                 logger.info("Barge-in: sent response.cancel")
-                                                response_active = False  # Response is now cancelled
+                                                response_active = False
                                             except Exception:
-                                                logger.exception("Barge-in: failed to send response.cancel")
+                                                logger.debug("Barge-in: response.cancel not needed (no active response)")
+
+                                        # Clear ACS playout buffer so already-buffered audio stops immediately
+                                        if session_id:
+                                            async def _clear_acs_buffer(_sid=session_id):
+                                                try:
+                                                    __sess = session_manager.active_sessions.get(_sid)
+                                                    if __sess and __sess.call_connection_id:
+                                                        from azure.communication.callautomation import CallAutomationClient
+                                                        __acs = CallAutomationClient.from_connection_string(config["acs_connection_string"])
+                                                        __conn = __acs.get_call_connection(__sess.call_connection_id)
+                                                        await asyncio.to_thread(__conn.cancel_all_media_operations)
+                                                        logger.info("[BARGE-IN] ACS buffer cleared")
+                                                except Exception as __be:
+                                                    logger.debug(f"[BARGE-IN] ACS buffer clear: {__be}")
+                                            asyncio.create_task(_clear_acs_buffer())
 
                                     if event_type in (
                                         "input_audio_buffer.speech_stopped",
                                         "input_audio_buffer.committed",
                                     ):
-                                        suppress_agent_audio = False
-                                        cancel_sent_for_current_turn = False
+                                        # --- TURN DETECTION: Unsuppress in background to avoid blocking the message loop ---
+                                        _speech_stop_ts = loop.time()
+                                        logger.info(f"[TURN DETECTION] Speech stopped, scheduling unsuppress in {TURN_DETECTION_DELAY}s")
+                                        async def _unsuppress_after_delay(_ts=_speech_stop_ts):
+                                            nonlocal suppress_agent_audio, cancel_sent_for_current_turn
+                                            await asyncio.sleep(TURN_DETECTION_DELAY)
+                                            if loop.time() - _ts >= TURN_DETECTION_DELAY:
+                                                suppress_agent_audio = False
+                                                cancel_sent_for_current_turn = False
+                                                logger.info("[TURN DETECTION] Delay complete, AI can now respond")
+                                        asyncio.create_task(_unsuppress_after_delay())
+                                        # --- END TURN DETECTION ---
 
                                     if suppress_agent_audio and event_type == "response.audio.delta":
                                         continue
@@ -483,12 +757,17 @@ class RTMiddleTier:
                                             last_prompt_stage = 0
                                             # Log transcription asynchronously (don't block message flow)
                                             if session_id:
-                                                await session_manager.log_transcription(
-                                                    session_id=session_id,
-                                                    speaker=transcription_data.get("speaker", "unknown"),
-                                                    utterance_text=transcription_data.get("utterance_text", ""),
-                                                    timestamp=transcription_data.get("timestamp")
-                                                )
+                                                try:
+                                                    await session_manager.log_transcription(
+                                                        session_id=session_id,
+                                                        speaker=transcription_data.get("speaker", "unknown"),
+                                                        utterance_text=transcription_data.get("utterance_text", ""),
+                                                        timestamp=transcription_data.get("timestamp")
+                                                    )
+                                                    logger.info(f"[TRANSCRIPTION SAVED] Session: {session_id}, Speaker: {transcription_data.get('speaker')}")
+                                                except Exception as e:
+                                                    logger.error(f"[TRANSCRIPTION ERROR] Failed to save transcription for session {session_id}: {e}")
+                                                    logger.exception(e)
 
                                             if transcription_data.get("speaker") == "customer":
                                                 utterance = transcription_data.get("utterance_text", "").strip()

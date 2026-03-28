@@ -202,6 +202,83 @@ class PhonebookLookup:
 
         self._loaded = True
 
+    def add_patient(self, patient_data: Dict[str, Any]) -> bool:
+        """
+        Append a new patient row to the phonebook XLSX.
+        Patienten-Nr. is left empty as requested.
+        
+        Args:
+            patient_data: Dict with keys matching phonebook columns
+        Returns:
+            bool: True if successfully added
+        """
+        try:
+            from openpyxl import load_workbook
+            
+            # Load workbook with write support
+            wb = load_workbook(self.xlsx_path)
+            ws = wb[wb.sheetnames[0]]
+            
+            # Find the header row
+            header_idx = None
+            for idx, row in enumerate(ws.iter_rows(values_only=True)):
+                cells = {str(c).strip() if c else "" for c in row}
+                if {"Patienten-Nr.", "Nachname", "Vorname"}.issubset(cells):
+                    header_idx = idx
+                    break
+            
+            if header_idx is None:
+                return False
+            
+            # Get header mapping
+            header_row = list(ws.iter_rows(values_only=True))[header_idx]
+            col_map = {}
+            for i, cell in enumerate(header_row):
+                if cell:
+                    col_map[str(cell).strip()] = i
+            
+            # Create new row data
+            new_row = [None] * len(header_row)
+            
+            # Column mappings
+            mappings = {
+                "Nachname": patient_data.get("last_name"),
+                "Vorname": patient_data.get("first_name"),
+                "Geburtsdatum": patient_data.get("birth_date"),
+                "Geschlecht": patient_data.get("gender"),
+                "Sprache": patient_data.get("language", "Deutsch"),
+                "PLZ": patient_data.get("zip_code"),
+                "Ort": patient_data.get("city"),
+                "Adresse": patient_data.get("address"),
+                "Telefon": patient_data.get("phone"),
+                "Mobile-Nr.": patient_data.get("phone"),  # Same as Telefon
+                "Email": patient_data.get("email", ""),
+                "Arzt": patient_data.get("doctor", ""),
+                "Notiz": patient_data.get("comment", ""),
+                # Patienten-Nr. intentionally left empty
+            }
+            
+            for col_name, value in mappings.items():
+                if col_name in col_map and value:
+                    new_row[col_map[col_name]] = value
+            
+            # Append row
+            ws.append(new_row)
+            
+            # Save workbook
+            wb.save(self.xlsx_path)
+            
+            # Reload the index
+            self._loaded = False
+            self._index.clear()
+            self.load()
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error adding patient to phonebook: {e}")
+            return False
+
     def lookup_by_phone(self, phone: Optional[str]) -> Optional[PhonebookMatch]:
         if not phone:
             return None
@@ -214,6 +291,46 @@ class PhonebookLookup:
                 return m
 
         return None
+
+
+def save_phonebook_to_blob(xlsx_path: str) -> bool:
+    """
+    Upload updated phonebook XLSX back to Azure Blob Storage.
+    
+    Args:
+        xlsx_path: Local path to the XLSX file
+    Returns:
+        bool: True if upload successful
+    """
+    try:
+        blob_url = (os.getenv("PHONEBOOK_BLOB_URL") or "").strip()
+        container = (os.getenv("PHONEBOOK_BLOB_CONTAINER") or "").strip()
+        blob_name = (os.getenv("PHONEBOOK_BLOB_NAME") or "").strip()
+        conn = (os.getenv("AZURE_BLOB_CONN") or "").strip()
+
+        if not conn:
+            return False
+
+        if not blob_url and not (container and blob_name):
+            return False
+
+        from azure.storage.blob import BlobServiceClient
+
+        service = BlobServiceClient.from_connection_string(conn)
+
+        if blob_url:
+            blob_client = service.get_blob_client(blob_url=blob_url)
+        else:
+            blob_client = service.get_blob_client(container=container, blob=blob_name)
+
+        with open(xlsx_path, "rb") as f:
+            blob_client.upload_blob(f, overwrite=True)
+
+        return True
+        
+    except Exception as e:
+        print(f"Error uploading phonebook to blob: {e}")
+        return False
 
 
 _phonebook_singleton: Optional[PhonebookLookup] = None

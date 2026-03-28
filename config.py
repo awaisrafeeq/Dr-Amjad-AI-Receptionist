@@ -5,6 +5,25 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- Doctor Configuration ---
+# List of doctors at MedCenter Volta with proper German titles
+DOCTORS = [
+    {"key": "mallisho", "name": "Dr. Mallisho", "german_title": "Herr Dr. Mallisho", "calendar_id": None},
+    {"key": "lumpp", "name": "Dr. Lumpp", "german_title": "Herr Dr. Lumpp", "calendar_id": None},
+    {"key": "keser", "name": "Dr. Keser", "german_title": "Frau Dr. Keser", "calendar_id": None},
+    {"key": "osterwalder", "name": "Dr. Osterwalder", "german_title": "Herr Dr. Osterwalder", "calendar_id": None},
+]
+
+# Doctor email mapping for routing (can be set via environment variable)
+# Format: {"mallisho": "mallisho@example.com", "lumpp": "lumpp@example.com", ...}
+DOCTOR_EMAILS_JSON = os.getenv("DOCTOR_EMAILS_JSON", "{}")
+
+try:
+    import json
+    DOCTOR_EMAILS = json.loads(DOCTOR_EMAILS_JSON)
+except:
+    DOCTOR_EMAILS = {}
+
 # --- Load Environment Variables ---
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")

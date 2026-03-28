@@ -342,6 +342,87 @@ class SessionManager:
         """Get all active sessions."""
         return list(self.active_sessions.values())
         
+    def get_session_by_call_connection_id(self, call_connection_id: str) -> Optional[CallSession]:
+        """Find an active session by its ACS callConnectionId."""
+        for session in self.active_sessions.values():
+            if session.call_connection_id == call_connection_id:
+                return session
+        return None
+        
+    async def send_transcript_email(self, session_id: str, caller_phone: Optional[str] = None) -> bool:
+        """
+        Retrieve transcript for a session and send it via email.
+        
+        Args:
+            session_id: Session ID to get transcript for
+            caller_phone: Optional caller phone number for email context
+            
+        Returns:
+            bool: True if email sent successfully
+        """
+        try:
+            from utils.email_service import email_service
+            
+            # Get all transcriptions for this session
+            transcript_data = await storage_logger.get_transcriptions_for_session(session_id)
+            
+            if not transcript_data:
+                logger.warning(f"No transcriptions found for session {session_id}, skipping email")
+                return False
+            
+            caller_info = {"phone": caller_phone} if caller_phone else None
+            
+            # --- DOCTOR-SPECIFIC EMAIL ROUTING ---
+            # Determine if this should go to a specific doctor
+            recipient = email_service.determine_recipient_from_transcript(transcript_data)
+            if recipient:
+                logger.info(f"[EMAIL ROUTING] Routing transcript for session {session_id} to doctor: {recipient}")
+            else:
+                logger.info(f"[EMAIL ROUTING] Using default recipient for session {session_id}")
+            # --- END DOCTOR ROUTING ---
+            
+            # Send the email
+            success = await email_service.send_transcript_email(
+                session_id=session_id,
+                transcript_data=transcript_data,
+                caller_info=caller_info,
+                recipient=recipient  # Will use default if None
+            )
+            
+            if success:
+                logger.info(f"Transcript email sent for session {session_id}")
+            else:
+                logger.error(f"Failed to send transcript email for session {session_id}")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error sending transcript email for session {session_id}: {e}")
+            return False
+        
+    def get_session_phonebook_info(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get phonebook match information for a session.
+        
+        Args:
+            session_id: Session ID to get phonebook info for
+            
+        Returns:
+            Dictionary with phonebook info and matched_caller status, or None
+        """
+        try:
+            session = self._sessions.get(session_id)
+            if not session:
+                return None
+            
+            return {
+                "matched_caller": session.get("matched_caller", False),
+                "phonebook_info": session.get("phonebook_info")
+            }
+        except Exception as e:
+            logger.error(f"Error getting session phonebook info: {e}")
+            return None
+        
     async def initialize(self):
         """Initialize the session manager and storage containers."""
         try:

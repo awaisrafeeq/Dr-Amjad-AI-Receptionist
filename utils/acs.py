@@ -30,32 +30,32 @@ class AcsCaller:
             transport_url=self.acs_media_streaming_websocket_path,
             transport_type=StreamingTransportType.WEBSOCKET,
             content_type=MediaStreamingContentType.AUDIO,
-            audio_channel_type=MediaStreamingAudioChannelType.MIXED,
+            audio_channel_type=MediaStreamingAudioChannelType.UNMIXED,
             start_media_streaming=True,
             enable_bidirectional=True,
             audio_format=AudioFormat.PCM24_K_MONO
         )
 
-    async def answer_inbound_call(self, incoming_call_context: str, callback_uri: str):
+    async def answer_inbound_call(self, incoming_call_context: str, callback_uri: str, session_id: str):
         client = CallAutomationClient.from_connection_string(self.acs_connection_string)
+
+        media_streaming_config = MediaStreamingOptions(
+            transport_url=f"{self.acs_media_streaming_websocket_path}?session_id={session_id}",
+            transport_type=StreamingTransportType.WEBSOCKET,
+            content_type=MediaStreamingContentType.AUDIO,
+            audio_channel_type=MediaStreamingAudioChannelType.UNMIXED,
+            start_media_streaming=True,
+            enable_bidirectional=True,
+            audio_format=AudioFormat.PCM24_K_MONO
+        )
 
         def _answer_call_sync():
             kwargs = {
                 "incoming_call_context": incoming_call_context,
-                "media_streaming": self.media_streaming_configuration,
+                "media_streaming": media_streaming_config,
                 "callback_url": callback_uri,
                 "operation_context": "incomingCall",
             }
-
-            # Passing a wrong endpoint can cause AnswerFailed (404/1600). Only pass when it looks like
-            # a Cognitive Services *resource* endpoint.
-            endpoint = (self.cognitive_services_endpoint or "").strip()
-            endpoint_lower = endpoint.lower()
-            if endpoint and (
-                "cognitiveservices.azure.com" in endpoint_lower
-                or ".api.cognitive.microsoft.com" in endpoint_lower
-            ):
-                kwargs["cognitive_services_endpoint"] = endpoint
 
             return client.answer_call(**kwargs)
 

@@ -532,3 +532,90 @@ async def get_last_change_id():
         return await epaad_client.get_latest_event_change_id()
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# Internal endpoint for adding new patients to phonebook (background/async)
+class AddToPhonebookRequest(BaseModel):
+    first_name: str
+    last_name: str
+    birth_date: str = Field(..., description="YYYY-MM-DD")
+    phone: str
+    gender: Optional[str] = "other"
+    email: Optional[str] = ""
+    doctor: Optional[str] = ""
+    comment: Optional[str] = ""
+    language: Optional[str] = "Deutsch"
+
+
+class AddToPhonebookResponse(BaseModel):
+    success: bool
+    message: str
+
+
+@router.post("/internal/add-to-phonebook", response_model=AddToPhonebookResponse, tags=["internal"])
+async def add_to_phonebook(payload: AddToPhonebookRequest):
+    """
+    Internal endpoint to add a new patient to the phonebook XLSX.
+    Called asynchronously after appointment booking for new patients.
+    """
+    try:
+        from utils.phonebook_lookup import get_phonebook_lookup, save_phonebook_to_blob
+        
+        lookup = get_phonebook_lookup()
+        if not lookup:
+            return AddToPhonebookResponse(
+                success=False,
+                message="Phonebook lookup not enabled"
+            )
+        
+        # Check if patient already exists
+        existing = lookup.lookup_by_phone(payload.phone)
+        if existing:
+            return AddToPhonebookResponse(
+                success=False,
+                message="Patient already exists in phonebook"
+            )
+        
+        # Prepare patient data
+        patient_data = {
+            "first_name": payload.first_name,
+            "last_name": payload.last_name,
+            "birth_date": payload.birth_date,
+            "phone": payload.phone,
+            "gender": payload.gender,
+            "email": payload.email,
+            "doctor": payload.doctor,
+            "comment": payload.comment,
+            "language": payload.language,
+        }
+        
+        # Add to local XLSX
+        added = lookup.add_patient(patient_data)
+        if not added:
+            return AddToPhonebookResponse(
+                success=False,
+                message="Failed to add patient to phonebook"
+            )
+        
+        # Upload updated XLSX back to Azure Blob
+        uploaded = save_phonebook_to_blob(lookup.xlsx_path)
+        
+        if uploaded:
+            logger.info(f"[Phonebook] Added patient {payload.first_name} {payload.last_name} and uploaded to blob")
+            return AddToPhonebookResponse(
+                success=True,
+                message="Patient added to phonebook and uploaded to Azure Blob"
+            )
+        else:
+            logger.warning(f"[Phonebook] Patient added locally but failed to upload to blob")
+            return AddToPhonebookResponse(
+                success=True,
+                message="Patient added to phonebook but blob upload failed (will retry on next call)"
+            )
+            
+    except Exception as e:
+        logger.error(f"[Phonebook] Error adding patient: {e}")
+        return AddToPhonebookResponse(
+            success=False,
+            message=f"Error: {str(e)}"
+        )
