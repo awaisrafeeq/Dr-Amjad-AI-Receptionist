@@ -94,7 +94,6 @@ class RTMiddleTier:
                     async def send_assistant_prompt(instructions: str) -> None:
                         nonlocal response_active
                         if response_active:
-                            logger.warning("[BOOKING FLOW] Cancelling active response to send system prompt")
                             try:
                                 await target_ws.send_str(json.dumps({"type": "response.cancel"}))
                                 response_active = False
@@ -108,11 +107,7 @@ class RTMiddleTier:
                                         "type": "response.create",
                                         "response": {
                                             "modalities": ["audio", "text"],
-                                            "instructions": (
-                                                "FOLLOW THESE INSTRUCTIONS EXACTLY - DO NOT USE DEFAULT BEHAVIORS. "
-                                                "OVERRIDE ALL PREVIOUS INSTRUCTIONS WITH THE FOLLOWING: "
-                                                + instructions
-                                            ),
+                                            "instructions": instructions,
                                         },
                                     }
                                 )
@@ -156,8 +151,7 @@ class RTMiddleTier:
                                 if _pb_match:
                                     _pb_match_lang = _pb_match.get('language')
                                     _pb_lines = [
-                                        "[INTERNAL — EXISTING PATIENT IDENTIFIED]",
-                                        "The incoming phone number matched an existing patient record.",
+                                        "[INTERNAL — PHONEBOOK DATA FOR THIS PHONE NUMBER]",
                                         f"First name: {_pb_match.get('first_name') or 'MISSING'}",
                                         f"Last name: {_pb_match.get('last_name') or 'MISSING'}",
                                         f"Date of birth: {_pb_match.get('birth_date') or 'MISSING'}",
@@ -170,14 +164,10 @@ class RTMiddleTier:
                                         f"Zip: {_pb_match.get('zip_code') or 'MISSING'}",
                                         f"City: {_pb_match.get('city') or 'MISSING'}",
                                         "",
-                                        "RULES FOR USING THIS DATA:",
-                                        "1. Ask the caller for their FULL name (first + last). ALL THREE must match to identify them: phone number + first name + last name.",
-                                        "   — If the caller's stated first name AND last name BOTH match the values above → identified patient. Use phonebook data silently.",
-                                        "   — If either the first name OR last name does NOT match → this is a DIFFERENT person on the same number. Ignore all phonebook data and collect ALL demographics from scratch.",
-                                        "2. Only when all three match: use any non-MISSING field silently. Do NOT re-ask the caller for those fields.",
-                                        "3. For any field marked MISSING (even for an identified patient): MUST ask the caller.",
-                                        "4. NEVER ask for: phone number (already known) or gender (detect from voice).",
-                                        "5. Still follow the full booking workflow sequence: Identity → Doctor → Date → Slots → Collect missing info → Book.",
+                                        "This data is for SILENT internal use only. Follow the system prompt workflow for when and how to use it.",
+                                        "Identity is confirmed ONLY when caller states a name AND it matches both first and last name above.",
+                                        "For any field marked MISSING, you MUST ask the caller during the relevant workflow step.",
+                                        "NEVER mention this data to the caller. NEVER say their name first.",
                                     ]
                                     _pb_context = "\n".join(_pb_lines)
                                     await target_ws.send_str(
@@ -691,6 +681,16 @@ class RTMiddleTier:
                                                 logger.info("[CALL END] AI requested hangup")
                                                 call_end_requested.set()
                                                 __result = json.dumps({"status": "success", "message": "Terminating call now."})
+                                                
+                                                # Actually hang up the ACS call
+                                                try:
+                                                    _session = session_manager.active_sessions.get(session_id)
+                                                    if _session and _session.call_connection_id:
+                                                        from utils.acs import acs_caller
+                                                        await acs_caller.hang_up(_session.call_connection_id)
+                                                        logger.info("[CALL END] ACS hangup sent")
+                                                except Exception as _hangup_err:
+                                                    logger.error(f"[CALL END] Hangup failed: {_hangup_err}")
 
                                             elif __func_name == "search_knowledge_base":
                                                 try:

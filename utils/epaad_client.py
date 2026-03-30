@@ -90,7 +90,6 @@ class EpaadClient:
             
             # DEBUG: Log request details
             logger.info(f"[EPAAD API REQUEST] {method} {url}")
-            import json
             logger.info(f"[EPAAD API REQUEST] params={params}, body={json.dumps(json_body) if json_body else None}")
 
             async with session.request(
@@ -114,7 +113,7 @@ class EpaadClient:
                         headers=self._auth_headers(),
                         params=params,
                         json=json_body,
-                        timeout=aiohttp.ClientTimeout(total=25),
+                        timeout=aiohttp.ClientTimeout(total=10),
                     ) as resp2:
                         data2 = await resp2.json(content_type=None)
                         logger.info(f"[EPAAD API RESPONSE] status={resp2.status}, has_data={data2 is not None}")

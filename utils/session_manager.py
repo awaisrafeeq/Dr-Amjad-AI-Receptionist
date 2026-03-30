@@ -3,6 +3,7 @@ Session Manager for tracking call sessions and coordinating logging
 """
 
 import logging
+import asyncio
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 from uuid import uuid4
@@ -38,6 +39,7 @@ class SessionManager:
     
     def __init__(self):
         self.active_sessions: Dict[str, CallSession] = {}
+        self._session_lock = asyncio.Lock()
         # self.session_call_mapping: Dict[str, str] = {}  # call_connection_id -> session_id
         
     async def create_session(self, event: Dict[Any, Any], event_type: str) -> str:
@@ -102,7 +104,8 @@ class SessionManager:
             session.phonebook_match = phonebook_match.to_dict()
 
         # Store in active sessions
-        self.active_sessions[session_id] = session
+        async with self._session_lock:
+            self.active_sessions[session_id] = session
         
         # Log initial call metadata
         metadata_doc = {
@@ -149,7 +152,8 @@ class SessionManager:
         except Exception as e:
             logger.error(f"[SESSION] Create error: {e}")
             # Clean up if logging failed
-            self.active_sessions.pop(session_id, None)
+            async with self._session_lock:
+                self.active_sessions.pop(session_id, None)
             raise
             
     async def end_session(self, session_id: Optional[str] = None, event_data: Optional[Dict[str, Any]] = None):
@@ -164,13 +168,12 @@ class SessionManager:
             bool: Success status
         """
         try:
-        
                 
-            if not session_id or session_id not in self.active_sessions:
-                logger.warning(f"[SESSION] Not found: {session_id}")
-                return False
-                
-            session = self.active_sessions[session_id]
+            async with self._session_lock:
+                if not session_id or session_id not in self.active_sessions:
+                    logger.warning(f"[SESSION] Not found: {session_id}")
+                    return False
+                session = self.active_sessions[session_id]
             
             if event_data is not None:
                 end_time_str = event_data.get("timestamp", datetime.now(timezone.utc))
@@ -221,9 +224,11 @@ class SessionManager:
             await storage_logger.log_call_history(session.history_id, phone_number, history_doc)
             
             # Remove from active sessions
-            self.active_sessions.pop(session_id, None)
+            async with self._session_lock:
+                self.active_sessions.pop(session_id, None)
             
             logger.info(f"[SESSION] Ended: {session_id}")
+            return True
             
         except Exception as e:
             logger.error(f"[SESSION] End error: {e}")
@@ -245,7 +250,8 @@ class SessionManager:
             
             log_id = str(uuid4())
             
-            session_data = self.active_sessions.get(session_id)
+            async with self._session_lock:
+                session_data = self.active_sessions.get(session_id)
             
             if event_data is not None:
                 
@@ -411,28 +417,19 @@ class SessionManager:
             return False
         
     def get_session_phonebook_info(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get phonebook match information for a session.
-        
-        Args:
-            session_id: Session ID to get phonebook info for
-            
-        Returns:
-            Dictionary with phonebook info and matched_caller status, or None
-        """
         try:
-            session = self._sessions.get(session_id)
+            session = self.active_sessions.get(session_id)
             if not session:
                 return None
-            
+                
             return {
-                "matched_caller": session.get("matched_caller", False),
-                "phonebook_info": session.get("phonebook_info")
+                "matched_caller": session.phonebook_match is not None,
+                "phonebook_info": session.phonebook_match
             }
         except Exception as e:
             logger.error(f"[SESSION] Phonebook info error: {e}")
             return None
-        
+
     async def initialize(self):
         """Initialize the session manager and storage containers."""
         try:

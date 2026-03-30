@@ -72,7 +72,7 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                     {
                         "type": "function",
                         "name": "book_appointment",
-                        "description": "Book an appointment for a patient. STRICT RULE: You MUST NOT call this function unless the caller has explicitly stated their FULL address (Street, Zip Code, and City). DO NOT invent or guess addresses (e.g. Bahnhofstrasse). If you lack exact address data, ask the caller and WAIT for their response instead of calling this tool. Determine appointment duration based on visit reason complexity (one issue=15min, two issues=20min, three+ issues/new patient=30min).",
+                        "description": "Book an appointment for a patient. All required fields must be populated with real data before calling.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -93,17 +93,8 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                             },
                             "required": [
                                 "calendar_id", "slot_iso", "patient_first_name", "patient_last_name", 
-                                "patient_dob", "patient_phone", "street", "street_number", "zip_code", "city", "visit_reason"
+                                "patient_dob", "patient_phone", "street", "street_number", "zip_code", "city", "visit_reason", "patient_email"
                             ]
-                        }
-                    },
-                    {
-                        "type": "function",
-                        "name": "get_available_doctors",
-                        "description": "Get the list of available doctors at MedCenter Volta. Returns all doctors with their names and German titles.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {}
                         }
                     },
                     {

@@ -57,25 +57,6 @@ async def inbound_call(request: Request):
                     caller_id = event.data["from"]["rawId"]
                 logger.info(f"[CALL] Incoming from: {caller_id}")
                 
-                # --- PHONEBOOK LOOKUP ---
-                phonebook_match = None
-                matched_caller = False
-                try:
-                    from utils.phonebook_lookup import get_phonebook_lookup
-                    lookup = get_phonebook_lookup()
-                    if lookup:
-                        phonebook_match = lookup.lookup_by_phone(caller_id)
-                        if phonebook_match:
-                            matched_caller = True
-                            logger.info(f"[PHONEBOOK] Match: {phonebook_match.first_name} {phonebook_match.last_name}")
-                        else:
-                            logger.debug(f"[PHONEBOOK] No match for {caller_id}")
-                    else:
-                        logger.debug(f"[PHONEBOOK] Lookup disabled")
-                except Exception as pb_error:
-                    logger.warning(f"[PHONEBOOK] Lookup error: {pb_error}")
-                # --- END PHONEBOOK LOOKUP ---
-                
                 # create a new session ID for this call
                 try:
                     event_payload = event.data
@@ -83,13 +64,13 @@ async def inbound_call(request: Request):
                         event_payload = json.loads(event_payload)
                     
                     # Add phonebook match info to session data
-                    session_data = {
-                        **event_payload,
-                        "matched_caller": matched_caller,
-                        "phonebook_info": phonebook_match.to_dict() if phonebook_match else None
-                    }
+                    # session_data = {
+                    #     **event_payload,
+                    #     "matched_caller": matched_caller,
+                    #     "phonebook_info": phonebook_match.to_dict() if phonebook_match else None
+                    # }
                     
-                    session_id = await session_manager.create_session(session_data, event.event_type)
+                    session_id = await session_manager.create_session(event_payload, event.event_type)
                     # Use session_id as the guid for the callback URL
                     guid = session_id
                 except Exception as session_error:
@@ -104,7 +85,9 @@ async def inbound_call(request: Request):
                 await caller.answer_inbound_call(incoming_call_context, callback_uri, session_id)
                 
                 return Response(status_code=200)
-            
+
+        return Response(status_code=200)
+
     except Exception as e:
         logger.exception("Error handling inbound call")
         try:
@@ -216,20 +199,20 @@ async def handle_callback(contextId: str, request: Request):
                 generic_event["details"]["resultInformation"] = event.data.get("resultInformation")
                 generic_event["status"] = 'disconnected'
                 
-                # End the session
-                await session_manager.end_session(
-                    session_id=contextId,
-                    event_data=generic_event
-                )
-                
                 # Send transcript email
                 try:
                     await session_manager.send_transcript_email(
                         session_id=contextId,
-                        caller_phone=caller_id if 'caller_id' in locals() else None
+                        caller_phone=caller_id if caller_id else None
                     )
                 except Exception as email_error:
                     logger.error(f"Email send error: {email_error}")
+                
+                # THEN end the session
+                await session_manager.end_session(
+                    session_id=contextId,
+                    event_data=generic_event
+                )
 
 
     except Exception as ex:
