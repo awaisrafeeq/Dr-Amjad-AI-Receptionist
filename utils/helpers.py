@@ -72,7 +72,7 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                     {
                         "type": "function",
                         "name": "book_appointment",
-                        "description": "Book an appointment for a patient. Use phonebook info for name/DOB if available. DO NOT ask for gender. Determine appointment duration based on visit reason complexity (one issue=15min, two issues=20min, three+ issues/new patient=30min).",
+                        "description": "Book an appointment for a patient. STRICT RULE: You MUST NOT call this function unless the caller has explicitly stated their FULL address (Street, Zip Code, and City). DO NOT invent or guess addresses (e.g. Bahnhofstrasse). If you lack exact address data, ask the caller and WAIT for their response instead of calling this tool. Determine appointment duration based on visit reason complexity (one issue=15min, two issues=20min, three+ issues/new patient=30min).",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -84,10 +84,10 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                                 "patient_phone": {"type": "string", "description": "Patient's phone number with country code (e.g. +41...)"},
                                 "patient_gender": {"type": "string", "enum": ["male", "female", "other"], "description": "Patient's gender. Detect automatically from the caller's voice (male vs female voice characteristics). Do NOT ask the patient. Use 'male' for clearly male voices, 'female' for clearly female voices, 'other' only when voice is completely ambiguous."},
                                 "patient_email": {"type": "string", "description": "Patient's email address for appointment confirmation. Ask the patient for it if not already known from the phonebook."},
-                                "street": {"type": "string", "description": "Patient's street name."},
+                                "street": {"type": "string", "description": "Patient's exact street name provided by caller. DO NOT GUESS OR INVENT. If missing, DO NOT call tool; ask caller first."},
                                 "street_number": {"type": "string", "description": "Patient's house/street number."},
-                                "zip_code": {"type": "string", "description": "Patient's zip code / postal code."},
-                                "city": {"type": "string", "description": "Patient's city."},
+                                "zip_code": {"type": "string", "description": "Patient's precise zip code provided by caller. DO NOT GUESS. If missing, ask caller first."},
+                                "city": {"type": "string", "description": "Patient's exact city provided by caller. DO NOT GUESS. If missing, ask caller first."},
                                 "visit_reason": {"type": "string", "description": "The reason for the visit as described by the patient. Used to determine appointment duration."},
                                 "comment": {"type": "string", "description": "Additional notes or comments for the appointment."}
                             },
@@ -113,6 +113,21 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                         "parameters": {
                             "type": "object",
                             "properties": {}
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "search_knowledge_base",
+                        "description": "Search the practice knowledge base for information about opening hours, address, services, and general practice policies. Call this when you don't know the answer to a caller's question.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "The search query, e.g., 'opening hours' or 'address'"
+                                }
+                            },
+                            "required": ["query"]
                         }
                     }
                 ],
@@ -162,10 +177,7 @@ def transform_openai_to_acs_format(msg_data: Any) -> Optional[Any]:
             }
         }
     # Message from the OpenAI Realtime API detecting, that the user starts speaking and interrupted the AI.
-    # In this case, we don't want to send the unplayed audio buffer to the client anymore and clear the buffer audio.
-    # Buffered audio is audio data that has been sent to Azure Communication Services, but not yet played by the client.
     if msg_data["type"] == "input_audio_buffer.speech_started":
-        logger.info("VAD detected: User started speaking")
         acs_message = None
 
     return acs_message
@@ -181,40 +193,33 @@ def extract_transcription_from_openai_message(msg_data: Any) -> Optional[dict]:
         Dictionary with transcription data or None if no transcription found
     """
     transcription_data = None
-    # Use high-precision timestamp to avoid conflicts
     current_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
     
-    logger.info(f"[TRANSCRIPTION EXTRACT] Processing message type: {msg_data.get('type')}")
-    
     if msg_data.get("type") == "input_audio_buffer.speech_started":
-        logger.info("[TRANSCRIPTION EXTRACT] User started speaking")
+        pass  # Speech start handled in rtmt.py
     elif msg_data.get("type") == "input_audio_buffer.committed":
-        logger.info("[TRANSCRIPTION EXTRACT] User stopped speaking")
+        pass  # Speech stop handled in rtmt.py
     elif msg_data.get("type") == "conversation.item.input_audio_transcription.completed":
         transcript = msg_data.get("transcript", "")
-        logger.info(f"[TRANSCRIPTION EXTRACT] Transcription completed: '{transcript}'")
         if transcript:
             transcription_data = {
                 "speaker": "customer",
                 "utterance_text": transcript,
                 "timestamp": current_time,
             }
-            logger.info(f"[TRANSCRIPTION EXTRACT] User said: {transcript}")
     elif msg_data.get("type") == "response.audio_transcript.done":
         transcript = msg_data.get("transcript", "")
-        logger.info(f"[TRANSCRIPTION EXTRACT] Agent transcript: '{transcript}'")
         if transcript:
             transcription_data = {
                 "speaker": "agent",
                 "utterance_text": transcript,
                 "timestamp": current_time
             }
-            logger.info(f"[TRANSCRIPTION EXTRACT] Agent said: {transcript}")
     
     elif msg_data.get("type") == "response.content_part.added":
-        logger.debug("Agent is speaking...")
+        pass
     elif msg_data.get("type") == "response.done":
-        logger.debug("Agent stopped speaking")
+        pass
     
     return transcription_data
 

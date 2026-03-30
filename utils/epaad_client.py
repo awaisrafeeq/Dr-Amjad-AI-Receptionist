@@ -90,7 +90,8 @@ class EpaadClient:
             
             # DEBUG: Log request details
             logger.info(f"[EPAAD API REQUEST] {method} {url}")
-            logger.info(f"[EPAAD API REQUEST] params={params}, body_keys={list(json_body.keys()) if json_body else None}")
+            import json
+            logger.info(f"[EPAAD API REQUEST] params={params}, body={json.dumps(json_body) if json_body else None}")
 
             async with session.request(
                 method,

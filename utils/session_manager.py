@@ -31,6 +31,7 @@ class CallSession:
     caller_id: Optional[str] = None
     transcription_count: int = 0
     event_count: int = 0
+    phonebook_match: Optional[Dict[str, Any]] = None
 
 class SessionManager:
     """Manages call sessions and coordinates logging activities."""
@@ -96,6 +97,10 @@ class SessionManager:
             status=status
         )
         
+        # Store phonebook match on session so rtmt can inject it into OpenAI context
+        if phonebook_match:
+            session.phonebook_match = phonebook_match.to_dict()
+
         # Store in active sessions
         self.active_sessions[session_id] = session
         
@@ -130,7 +135,7 @@ class SessionManager:
         }
         
         try:
-            logger.info(f"Logging call metadata for session {session_id}")
+            logger.info(f"[SESSION] Created: {session_id}")
             await storage_logger.log_call_metadata(metadata_doc)
             await self.log_event(session_id, {
                 'event_type': event_type,
@@ -139,11 +144,10 @@ class SessionManager:
             })
             await storage_logger.log_call_history(session.history_id, phone_number, history_doc)
             
-            logger.info(f"Created new session {session_id} for call")
             return session_id
             
         except Exception as e:
-            logger.error(f"Error creating session: {e}")
+            logger.error(f"[SESSION] Create error: {e}")
             # Clean up if logging failed
             self.active_sessions.pop(session_id, None)
             raise
@@ -163,7 +167,7 @@ class SessionManager:
         
                 
             if not session_id or session_id not in self.active_sessions:
-                logger.warning(f"Session not found: {session_id}")
+                logger.warning(f"[SESSION] Not found: {session_id}")
                 return False
                 
             session = self.active_sessions[session_id]
@@ -205,8 +209,12 @@ class SessionManager:
             
             phone_number = session.participants[0]['phone_number'] if session.participants else "unknown"
             history_doc = {
+                "PartitionKey": phone_number,
+                "RowKey": session.history_id,
                 "sessionId": session_id,
                 "date": session.start_time.isoformat(),
+                "call_connection_id": session.call_connection_id,
+                "end_time": session.end_time.isoformat(),
                 "direction": session.direction,
                 "Duration": session.total_duration,
             }
@@ -214,14 +222,11 @@ class SessionManager:
             
             # Remove from active sessions
             self.active_sessions.pop(session_id, None)
-            # Remove from call mapping if call_connection_id exists
-            # if session.call_connection_id:
-                # self.session_call_mapping.pop(session.call_connection_id, None)
             
-            logger.info(f"Ended session {session_id}")
+            logger.info(f"[SESSION] Ended: {session_id}")
             
         except Exception as e:
-            logger.error(f"Error ending session {session_id}: {e}")
+            logger.error(f"[SESSION] End error: {e}")
             return False
             
     async def log_event(self, session_id: Optional[str] = None, event_data: Optional[Dict[str, Any]] = None):
@@ -235,7 +240,7 @@ class SessionManager:
         try:
                 
             if not session_id:
-                logger.warning("Could not resolve session for event logging")
+                logger.debug("No session for event")
                 return
             
             log_id = str(uuid4())
@@ -272,16 +277,16 @@ class SessionManager:
                 
                 await storage_logger.log_session_event(log_id, session_id, event_data)
             else:
-                logger.warning(f"Event data is None for session {session_id}")
+                logger.debug(f"Empty event for {session_id}")
             
             # Update session stats
             if session_id in self.active_sessions:
                 self.active_sessions[session_id].event_count += 1
                 
-            logger.debug(f"Logged event for session {session_id}: {event_data['event_type'] if event_data else 'Unknown'}")
+            logger.debug(f"[EVENT] {session_id[:8]}: {event_data['event_type'] if event_data else 'Unknown'}")
             
         except Exception as e:
-            logger.error(f"Error logging event: {e}")
+            logger.error(f"[EVENT] Log error: {e}")
     
     async def log_transcription(self, session_id: str, speaker: str, utterance_text: str, 
                                timestamp: Optional[str] = None) -> str:
@@ -327,11 +332,11 @@ class SessionManager:
             if session_id in self.active_sessions:
                 self.active_sessions[session_id].transcription_count += 1
             
-            logger.info(f"Logged transcription for session {session_id}: {speaker} - {utterance_text[:50]}...")
+            logger.debug(f"[TRANSCRIPT] {session_id[:8]}: {speaker} - {utterance_text[:30]}...")
             return transcription_id
             
         except Exception as e:
-            logger.error(f"Error logging transcription for session {session_id}: {e}")
+            logger.error(f"[TRANSCRIPT] Error: {e}")
             raise
     
     def get_session(self, session_id: str) -> Optional[CallSession]:
@@ -362,12 +367,17 @@ class SessionManager:
         """
         try:
             from utils.email_service import email_service
+            import asyncio
+            
+            # Wait for any pending transcriptions to be saved to Cosmos DB
+            # This ensures we capture the last few utterances before call ends
+            await asyncio.sleep(3)
             
             # Get all transcriptions for this session
             transcript_data = await storage_logger.get_transcriptions_for_session(session_id)
             
             if not transcript_data:
-                logger.warning(f"No transcriptions found for session {session_id}, skipping email")
+                logger.warning(f"[EMAIL] No transcripts for {session_id}")
                 return False
             
             caller_info = {"phone": caller_phone} if caller_phone else None
@@ -376,9 +386,9 @@ class SessionManager:
             # Determine if this should go to a specific doctor
             recipient = email_service.determine_recipient_from_transcript(transcript_data)
             if recipient:
-                logger.info(f"[EMAIL ROUTING] Routing transcript for session {session_id} to doctor: {recipient}")
+                logger.info(f"[EMAIL] To doctor: {recipient}")
             else:
-                logger.info(f"[EMAIL ROUTING] Using default recipient for session {session_id}")
+                logger.info(f"[EMAIL] To default")
             # --- END DOCTOR ROUTING ---
             
             # Send the email
@@ -386,18 +396,18 @@ class SessionManager:
                 session_id=session_id,
                 transcript_data=transcript_data,
                 caller_info=caller_info,
-                recipient=recipient  # Will use default if None
+                recipient=recipient
             )
             
             if success:
-                logger.info(f"Transcript email sent for session {session_id}")
+                logger.info(f"[EMAIL] Sent for {session_id}")
             else:
-                logger.error(f"Failed to send transcript email for session {session_id}")
+                logger.error(f"[EMAIL] Failed for {session_id}")
             
             return success
             
         except Exception as e:
-            logger.error(f"Error sending transcript email for session {session_id}: {e}")
+            logger.error(f"[EMAIL] Error: {e}")
             return False
         
     def get_session_phonebook_info(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -420,16 +430,16 @@ class SessionManager:
                 "phonebook_info": session.get("phonebook_info")
             }
         except Exception as e:
-            logger.error(f"Error getting session phonebook info: {e}")
+            logger.error(f"[SESSION] Phonebook info error: {e}")
             return None
         
     async def initialize(self):
         """Initialize the session manager and storage containers."""
         try:
             await storage_logger.initialize_containers()
-            logger.info("Session manager initialized successfully")
+            logger.info("[SESSION] Initialized")
         except Exception as e:
-            logger.error(f"Error initializing session manager: {e}")
+            logger.error(f"[SESSION] Init error: {e}")
             raise
 
 # Global session manager instance
