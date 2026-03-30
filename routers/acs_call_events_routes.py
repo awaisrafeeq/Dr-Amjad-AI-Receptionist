@@ -8,6 +8,7 @@ from azure.core.messaging import CloudEvent
 from utils.acs import acs_caller
 from utils.rtmt import rtmt
 from utils.session_manager import session_manager
+from utils.phonebook_lookup import normalize_phone_variants
 import json
 from datetime import datetime, timezone
 import asyncio
@@ -31,7 +32,7 @@ async def inbound_call(request: Request):
     # Handle incoming call events
     try:
         event_data = await request.json()
-        logger.info(f"Received ACS event data: {event_data}")
+        logger.debug(f"ACS event received")
 
         if isinstance(event_data, dict):
             event_data = [event_data]
@@ -40,24 +41,23 @@ async def inbound_call(request: Request):
         
         # EventGrid sends events in an array
         for event_dict in event_data:
-            logger.info(f"Processing event: {event_dict}")
+            logger.debug(f"Processing: {event_dict.get('eventType', 'unknown')}")
             event = EventGridEvent.from_dict(event_dict)
             
             if event.event_type == SystemEventNames.EventGridSubscriptionValidationEventName:
-                logger.info("Validating subscription")
+                logger.debug("Validating subscription")
                 validation_code = event.data["validationCode"]
                 return JSONResponse(content={"validationResponse": validation_code}, status_code=200)
             
             elif event.event_type == "Microsoft.Communication.IncomingCall":
-                logger.info(f"Incoming call event data: {event}")
                 incoming_call_context = event.data['incomingCallContext']
                 if event.data["from"]["kind"] == "phoneNumber":
                     caller_id = event.data["from"]["phoneNumber"]["value"]
                 else:
                     caller_id = event.data["from"]["rawId"]
-                logger.info(f"Incoming call answered from: {caller_id}")
+                logger.info(f"[CALL] Incoming from: {caller_id}")
                 
-                # --- PHONEBOOK LOOKUP: Check if caller is known ---
+                # --- PHONEBOOK LOOKUP ---
                 phonebook_match = None
                 matched_caller = False
                 try:
@@ -67,11 +67,13 @@ async def inbound_call(request: Request):
                         phonebook_match = lookup.lookup_by_phone(caller_id)
                         if phonebook_match:
                             matched_caller = True
-                            logger.info(f"[PHONEBOOK] Caller matched: {phonebook_match.first_name} {phonebook_match.last_name}")
+                            logger.info(f"[PHONEBOOK] Match: {phonebook_match.first_name} {phonebook_match.last_name}")
                         else:
-                            logger.info(f"[PHONEBOOK] No match found for caller: {caller_id}")
+                            logger.debug(f"[PHONEBOOK] No match for {caller_id}")
+                    else:
+                        logger.debug(f"[PHONEBOOK] Lookup disabled")
                 except Exception as pb_error:
-                    logger.warning(f"[PHONEBOOK] Error during lookup: {pb_error}")
+                    logger.warning(f"[PHONEBOOK] Lookup error: {pb_error}")
                 # --- END PHONEBOOK LOOKUP ---
                 
                 # create a new session ID for this call
@@ -91,13 +93,13 @@ async def inbound_call(request: Request):
                     # Use session_id as the guid for the callback URL
                     guid = session_id
                 except Exception as session_error:
-                    logger.error(f"Session creation error (non-fatal): {session_error}")
+                    logger.error(f"Session creation error: {session_error}")
                     guid = uuid.uuid4()
                     session_id = str(guid)
                 
                 query_parameters = urlencode({"callerId": caller_id})
                 callback_uri = f"{caller.acs_callback_path}/{guid}?{query_parameters}"
-                logger.info("callback url: %s", callback_uri)
+                logger.debug(f"Callback: {callback_uri[:60]}...")
                 
                 await caller.answer_inbound_call(incoming_call_context, callback_uri, session_id)
                 
@@ -137,9 +139,8 @@ async def handle_callback(contextId: str, request: Request):
 
         for event_dict in callbacks:
             event = CloudEvent.from_dict(event_dict)
-            logger.info(event.type)
-
-            logger.info("call event data=%s", event.data)
+            logger.debug(f"Event: {event.type}")
+            
             call_connection_id = event.data['callConnectionId']
             
             generic_event = {
@@ -228,11 +229,11 @@ async def handle_callback(contextId: str, request: Request):
                         caller_phone=caller_id if 'caller_id' in locals() else None
                     )
                 except Exception as email_error:
-                    logger.error(f"Error sending transcript email: {email_error}")
+                    logger.error(f"Email send error: {email_error}")
 
 
     except Exception as ex:
-        logger.exception("error in event handling: %s", ex)
+        logger.exception(f"Event handling error: {ex}")
         event = {
             "event_type": "error",
             "details": str(ex),
@@ -252,7 +253,7 @@ async def websocket_handler_acs(websocket: WebSocket):
     # Get session_id from query parameters
     current_session_id = websocket.query_params.get("session_id")
     if not current_session_id:
-        logger.warning("WebSocket connected without session_id query parameter!")
+        logger.warning("WebSocket connected without session_id!")
     
     try:
         # Add a timeout to prevent hanging connections
@@ -261,9 +262,9 @@ async def websocket_handler_acs(websocket: WebSocket):
             timeout=None  # You can set a reasonable timeout like 3600 for 1 hour
         )
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
+        logger.debug("WebSocket disconnected")
     except asyncio.CancelledError:
-        logger.info("WebSocket connection cancelled during reload")
+        logger.debug("WebSocket cancelled")
         raise
     except Exception as e:
         logger.error(f"WebSocket error: {e}")

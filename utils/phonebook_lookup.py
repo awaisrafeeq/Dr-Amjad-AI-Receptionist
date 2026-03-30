@@ -24,6 +24,9 @@ class PhonebookMatch:
     email: Optional[str] = None
     doctor: Optional[str] = None
     note: Optional[str] = None
+    address: Optional[str] = None
+    zip_code: Optional[str] = None
+    city: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -146,7 +149,7 @@ class PhonebookLookup:
 
     def __init__(self, xlsx_path: str):
         self.xlsx_path = xlsx_path
-        self._index: Dict[str, PhonebookMatch] = {}
+        self._index: Dict[str, List[PhonebookMatch]] = {}
         self._loaded = False
 
     def load(self) -> None:
@@ -193,12 +196,16 @@ class PhonebookLookup:
                 email=get(r, "Email"),
                 doctor=get(r, "Arzt"),
                 note=get(r, "Notiz"),
+                address=get(r, "Adresse"),
+                zip_code=get(r, "PLZ"),
+                city=get(r, "Ort"),
             )
 
             for raw in [match.phone, match.mobile]:
                 for v in normalize_phone_variants(raw):
-                    # Keep first match only to avoid accidental overwrites.
-                    self._index.setdefault(v, match)
+                    if v not in self._index:
+                        self._index[v] = []
+                    self._index[v].append(match)
 
         self._loaded = True
 
@@ -214,6 +221,9 @@ class PhonebookLookup:
         """
         try:
             from openpyxl import load_workbook
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"[PHONEBOOK] Attempting to add new patient to {self.xlsx_path} with data: {patient_data}")
             
             # Load workbook with write support
             wb = load_workbook(self.xlsx_path)
@@ -228,6 +238,7 @@ class PhonebookLookup:
                     break
             
             if header_idx is None:
+                logger.error("[PHONEBOOK] Failed to find header row in Excel file.")
                 return False
             
             # Get header mapping
@@ -251,12 +262,14 @@ class PhonebookLookup:
                 "Ort": patient_data.get("city"),
                 "Adresse": patient_data.get("address"),
                 "Telefon": patient_data.get("phone"),
-                "Mobile-Nr.": patient_data.get("phone"),  # Same as Telefon
+                "Mobile-Nr.": patient_data.get("mobile") or patient_data.get("phone"),
                 "Email": patient_data.get("email", ""),
                 "Arzt": patient_data.get("doctor", ""),
                 "Notiz": patient_data.get("comment", ""),
                 # Patienten-Nr. intentionally left empty
             }
+            
+            logger.info(f"[PHONEBOOK] Mapping data to excel columns: {mappings}")
             
             for col_name, value in mappings.items():
                 if col_name in col_map and value:
@@ -267,28 +280,183 @@ class PhonebookLookup:
             
             # Save workbook
             wb.save(self.xlsx_path)
+            logger.info(f"[PHONEBOOK] Successfully appended and saved new patient to {self.xlsx_path}")
             
             # Reload the index
             self._loaded = False
             self._index.clear()
             self.load()
+            logger.info("[PHONEBOOK] Successfully reloaded internal phonebook index.")
             
             return True
             
         except Exception as e:
-            print(f"Error adding patient to phonebook: {e}")
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"[PHONEBOOK] Error adding patient to phonebook: {e}")
+            return False
+
+    def update_patient(self, phone: str, patient_data: Dict[str, Any], first_name: Optional[str] = None, last_name: Optional[str] = None) -> bool:
+        """
+        Updates an existing patient row in the phonebook XLSX based on their phone number and name.
+        """
+        try:
+            from openpyxl import load_workbook
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"[PHONEBOOK] Attempting to update patient {first_name} {last_name} with phone {phone} in {self.xlsx_path}")
+            
+            # Find the match to ensure they exist
+            match = self.lookup_by_phone_and_name(phone, first_name, last_name)
+            if not match:
+                logger.error(f"[PHONEBOOK] Cannot update: Patient {first_name} {last_name} with phone {phone} not found in index.")
+                return False
+                
+            wb = load_workbook(self.xlsx_path)
+            ws = wb[wb.sheetnames[0]]
+            
+            # Find the header row
+            header_idx = None
+            for idx, row in enumerate(ws.iter_rows(values_only=True)):
+                cells = {str(c).strip() if c else "" for c in row}
+                if {"Patienten-Nr.", "Nachname", "Vorname"}.issubset(cells):
+                    header_idx = idx
+                    break
+            
+            if header_idx is None:
+                logger.error("[PHONEBOOK] Failed to find header row in Excel file.")
+                return False
+                
+            # Get header mapping
+            header_row = list(ws.iter_rows(values_only=True))[header_idx]
+            col_map = {}
+            for i, cell in enumerate(header_row):
+                if cell:
+                    col_map[str(cell).strip()] = i
+                    
+            # Find the correct row to update
+            target_row_idx = None
+            
+            cmp_first = (first_name or "").strip().lower()
+            cmp_last = (last_name or "").strip().lower()
+            
+            for idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                if idx <= header_idx + 1:
+                    continue
+                # Check phone columns
+                phone_col = col_map.get("Telefon")
+                mobile_col = col_map.get("Mobile-Nr.")
+                first_col = col_map.get("Vorname")
+                last_col = col_map.get("Nachname")
+                pat_no_col = col_map.get("Patienten-Nr.")
+                
+                cell_phone = str(row[phone_col]).strip() if phone_col is not None and row[phone_col] else ""
+                cell_mobile = str(row[mobile_col]).strip() if mobile_col is not None and row[mobile_col] else ""
+                cell_first = str(row[first_col]).strip().lower() if first_col is not None and row[first_col] else ""
+                cell_last = str(row[last_col]).strip().lower() if last_col is not None and row[last_col] else ""
+                cell_pat_no = str(row[pat_no_col]).strip() if pat_no_col is not None and row[pat_no_col] else ""
+                
+                # If we have a patient_number on the match, we can use it as a highly reliable tie-breaker
+                is_phone_match = False
+                from utils.phonebook_lookup import normalize_phone_variants
+                row_variants = set(normalize_phone_variants(cell_phone)) | set(normalize_phone_variants(cell_mobile))
+                for v in normalize_phone_variants(phone):
+                    if v in row_variants:
+                        is_phone_match = True
+                        break
+                        
+                if is_phone_match:
+                    # If match object has a patient number, compare it
+                    if match.patient_number and cell_pat_no and match.patient_number == cell_pat_no:
+                        target_row_idx = idx
+                        break
+                    
+                    # Otherwise, if names were provided, try to match by name
+                    elif cmp_first or cmp_last:
+                        if (cmp_first and cmp_first == cell_first) or (cmp_last and cmp_last == cell_last):
+                            target_row_idx = idx
+                            break
+                    else:
+                        # Fallback to the first matched phone row
+                        target_row_idx = idx
+                        break
+                        
+            if not target_row_idx:
+                logger.error(f"[PHONEBOOK] Match found in memory but could not find corresponding row in Excel for {phone}")
+                return False
+                
+            # Column mappings (we only update fields that were provided in patient_data)
+            mappings = {
+                "Nachname": patient_data.get("last_name"),
+                "Vorname": patient_data.get("first_name"),
+                "Geburtsdatum": patient_data.get("birth_date"),
+                "Geschlecht": patient_data.get("gender"),
+                "Sprache": patient_data.get("language"),
+                "PLZ": patient_data.get("zip_code"),
+                "Ort": patient_data.get("city"),
+                "Adresse": patient_data.get("address"),
+                "Email": patient_data.get("email"),
+                "Arzt": patient_data.get("doctor"),
+                "Notiz": patient_data.get("comment"),
+            }
+            
+            logger.info(f"[PHONEBOOK] Updating row {target_row_idx} with fields: {mappings}")
+            
+            for col_name, value in mappings.items():
+                if col_name in col_map and value:
+                    ws.cell(row=target_row_idx, column=col_map[col_name] + 1).value = value
+            
+            wb.save(self.xlsx_path)
+            logger.info(f"[PHONEBOOK] Successfully updated patient in {self.xlsx_path}")
+            
+            self._loaded = False
+            self._index.clear()
+            self.load()
+            logger.info("[PHONEBOOK] Successfully reloaded internal phonebook index.")
+            
+            return True
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"[PHONEBOOK] Error updating patient in phonebook: {e}")
             return False
 
     def lookup_by_phone(self, phone: Optional[str]) -> Optional[PhonebookMatch]:
+        """Returns the first phonebook match for the given phone number."""
         if not phone:
             return None
 
         self.load()
 
         for v in normalize_phone_variants(phone):
-            m = self._index.get(v)
-            if m is not None:
-                return m
+            matches = self._index.get(v)
+            if matches:
+                return matches[0]
+
+        return None
+
+    def lookup_by_phone_and_name(self, phone: Optional[str], first_name: Optional[str], last_name: Optional[str]) -> Optional[PhonebookMatch]:
+        """Returns the phonebook match for the given phone number that also matches the provided name."""
+        if not phone:
+            return None
+
+        self.load()
+        
+        cmp_first = (first_name or "").strip().lower()
+        cmp_last = (last_name or "").strip().lower()
+
+        for v in normalize_phone_variants(phone):
+            matches = self._index.get(v)
+            if matches:
+                # Both first AND last name must match — one phone can belong to multiple people
+                if cmp_first and cmp_last:
+                    for m in matches:
+                        m_first = (m.first_name or "").strip().lower()
+                        m_last = (m.last_name or "").strip().lower()
+                        if cmp_first == m_first and cmp_last == m_last:
+                            return m
+                    # Phone matched but neither entry had matching both names → no identity match
+                    return None
 
         return None
 

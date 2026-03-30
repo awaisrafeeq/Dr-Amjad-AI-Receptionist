@@ -1,5 +1,6 @@
 import aiohttp
 import asyncio
+import base64
 import json
 from json import JSONDecodeError
 from typing import Any, Optional, List, Dict, Tuple
@@ -55,6 +56,7 @@ class RTMiddleTier:
 
         self.selected_voice = "shimmer"
         self.system_message = load_prompt_from_markdown("system_prompt.md")
+        self._doctor_cache: Dict[int, str] = {}  # calendar_id -> doctor_name, avoids extra GET /calendars after booking
 
     
     async def forward_messages(self, ws: WebSocket, is_acs_audio_stream: bool, session_id: Optional[str] = None):
@@ -66,9 +68,9 @@ class RTMiddleTier:
             ws_url = f"/openai/realtime?api-version={self.api_version}&deployment={self.deployment}"
             
             try:
-                logger.info("Connecting to Azure OpenAI Realtime: %s%s", self.endpoint, ws_url)
+                # logger.info("Connecting to Azure OpenAI Realtime: %s%s", self.endpoint, ws_url)
                 async with session.ws_connect(ws_url, headers=headers) as target_ws:
-                    logger.info("Connected to Azure OpenAI Realtime")
+                    # logger.info("Connected to Azure OpenAI Realtime")
 
                     loop = asyncio.get_running_loop()
                     session_initialized = asyncio.Event()
@@ -85,82 +87,6 @@ class RTMiddleTier:
                     suppress_agent_audio = False
                     cancel_sent_for_current_turn = False
                     response_active = False
-
-                    def _detect_language(text: str) -> Optional[str]:
-                        if not text:
-                            return None
-                        if detect_lang is None:
-                            return None
-                        try:
-                            return detect_lang(text)
-                        except Exception:
-                            return None
-
-                    async def maybe_update_kb_context(user_text: str) -> None:
-                        nonlocal last_kb_context, detected_conversation_language
-                        if not user_text:
-                            return
-
-                        user_lang = _detect_language(user_text)
-                        if user_lang:
-                            detected_conversation_language = user_lang
-
-                        try:
-                            results = await document_processor.search_knowledge_base(
-                                query=user_text,
-                                language=user_lang,
-                                k=5,
-                            )
-
-                            if not results and user_lang:
-                                results = await document_processor.search_knowledge_base(
-                                    query=user_text,
-                                    language=None,
-                                    k=5,
-                                )
-
-                            if not results:
-                                return
-
-                            blocks = []
-                            for r in results:
-                                content = (r.get("content") or "").strip()
-                                if not content:
-                                    continue
-                                src = (r.get("source_url") or r.get("source_file") or "").strip()
-                                if src:
-                                    blocks.append(f"Source: {src}\n{content}")
-                                else:
-                                    blocks.append(content)
-
-                            if not blocks:
-                                return
-
-                            combined = "\n\n".join(blocks)
-                            # Keep it bounded to avoid prompt bloat
-                            combined = combined[:3500]
-                            if combined == last_kb_context:
-                                return
-
-                            last_kb_context = combined
-                            await target_ws.send_str(
-                                json.dumps(
-                                    {
-                                        "type": "session.update",
-                                        "session": {
-                                            "instructions": (
-                                                (self.system_message or "")
-                                                + "\n\nUse the following knowledge base excerpts to answer user questions. "
-                                                + "If they are not relevant, ignore them. Answer in the user's language.\n\n"
-                                                + combined
-                                            )
-                                        },
-                                    }
-                                )
-                            )
-                            logger.info("KB context injected (lang=%s, chars=%s)", user_lang, len(combined))
-                        except Exception:
-                            logger.exception("KB retrieval/injection failed")
 
 
                     # Native Tool Calling Handlers will be here
@@ -200,59 +126,103 @@ class RTMiddleTier:
                         try:
                             await asyncio.wait_for(session_initialized.wait(), timeout=10)
                         except asyncio.TimeoutError:
-                            logger.warning("Timed out waiting for session initialization; greeting may not be sent")
+                            logger.warning("Session init timeout")
                             return
 
                         try:
                             await asyncio.wait_for(session_confirmed.wait(), timeout=2)
-                            logger.info("Session confirmed by OpenAI, sending greeting")
+                            logger.debug("Session confirmed")
                         except asyncio.TimeoutError:
-                            logger.info("session.updated taking time, sending greeting...")
+                            logger.debug("Session confirm timeout")
 
                         if greeting_sent.is_set():
                             return
 
-                        # --- HARDCODED OPENING GREETING ---
-                        # Send the exact German greeting as the first utterance
-                        hardcoded_greeting = "MedCenter Volta, Sie sprechen mit Kaya, der digitalen Assistentin. Wie kann ich Ihnen behilflich sein?"
-                        
+                        # If session_id is known but NOT in active_sessions, the app restarted mid-call.
+                        # ACS reconnected to the new instance — do NOT send another greeting.
+                        if session_id and session_id not in session_manager.active_sessions:
+                            logger.warning(f"[GREETING] Skipping — session {session_id[:8]} not in memory (app restart reconnect)")
+                            greeting_sent.set()
+                            return
+
+                        # --- INJECT PHONEBOOK MATCH INTO SESSION INSTRUCTIONS ---
+                        # If the caller was recognised in the internal phonebook, tell OpenAI
+                        # about it now so it can silently use their details during the call.
+                        _pb_match_lang = None
                         try:
-                            await target_ws.send_str(
-                                json.dumps({
-                                    "type": "conversation.item.create",
-                                    "item": {
-                                        "type": "message",
-                                        "role": "assistant",
-                                        "content": [
-                                            {
-                                                "type": "input_text",
-                                                "text": hardcoded_greeting
+                            if session_id:
+                                _pb_sess = session_manager.active_sessions.get(session_id)
+                                _pb_match = _pb_sess.phonebook_match if _pb_sess else None
+                                if _pb_match:
+                                    _pb_match_lang = _pb_match.get('language')
+                                    _pb_lines = [
+                                        "[INTERNAL — EXISTING PATIENT IDENTIFIED]",
+                                        "The incoming phone number matched an existing patient record.",
+                                        f"First name: {_pb_match.get('first_name') or 'MISSING'}",
+                                        f"Last name: {_pb_match.get('last_name') or 'MISSING'}",
+                                        f"Date of birth: {_pb_match.get('birth_date') or 'MISSING'}",
+                                        f"Phone: {_pb_match.get('phone') or 'MISSING'}",
+                                        f"Email: {_pb_match.get('email') or 'MISSING'}",
+                                        f"Doctor: {_pb_match.get('doctor') or 'MISSING'}",
+                                        f"Language: {_pb_match.get('language') or 'MISSING'}",
+                                        f"Gender: {_pb_match.get('gender') or 'MISSING'}",
+                                        f"Address: {_pb_match.get('address') or 'MISSING'}",
+                                        f"Zip: {_pb_match.get('zip_code') or 'MISSING'}",
+                                        f"City: {_pb_match.get('city') or 'MISSING'}",
+                                        "",
+                                        "RULES FOR USING THIS DATA:",
+                                        "1. Ask the caller for their FULL name (first + last). ALL THREE must match to identify them: phone number + first name + last name.",
+                                        "   — If the caller's stated first name AND last name BOTH match the values above → identified patient. Use phonebook data silently.",
+                                        "   — If either the first name OR last name does NOT match → this is a DIFFERENT person on the same number. Ignore all phonebook data and collect ALL demographics from scratch.",
+                                        "2. Only when all three match: use any non-MISSING field silently. Do NOT re-ask the caller for those fields.",
+                                        "3. For any field marked MISSING (even for an identified patient): MUST ask the caller.",
+                                        "4. NEVER ask for: phone number (already known) or gender (detect from voice).",
+                                        "5. Still follow the full booking workflow sequence: Identity → Doctor → Date → Slots → Collect missing info → Book.",
+                                    ]
+                                    _pb_context = "\n".join(_pb_lines)
+                                    await target_ws.send_str(
+                                        json.dumps({
+                                            "type": "session.update",
+                                            "session": {
+                                                "instructions": (self.system_message or "") + "\n\n" + _pb_context
                                             }
-                                        ]
-                                    }
-                                })
-                            )
-                            # Trigger the response to speak the greeting
+                                        })
+                                    )
+                                    logger.info(f"[PHONEBOOK] Injected match for {_pb_match.get('first_name')} {_pb_match.get('last_name')} into OpenAI session")
+                        except Exception as _pb_err:
+                            logger.warning(f"[PHONEBOOK] Failed to inject context into session: {_pb_err}")
+                        # --- END PHONEBOOK INJECTION ---
+
+                        # --- HARDCODED OPENING GREETING ---
+                        # Use response.create with explicit instructions so OpenAI
+                        # actually SPEAKS the exact sentence rather than treating it
+                        # as already-spoken history (which conversation.item.create does).
+                        hardcoded_greeting = "MedCenter Volta, Sie sprechen mit Kaya, der digitalen Assistentin. Wie kann ich Ihnen behilflich sein?"
+                        if _pb_match_lang:
+                            _lang_lower = _pb_match_lang.lower()
+                            if "en" in _lang_lower or "english" in _lang_lower:
+                                hardcoded_greeting = "MedCenter Volta, you are speaking with Kaya, the digital assistant. How may I help you?"
+
+                        try:
                             await target_ws.send_str(
                                 json.dumps({
                                     "type": "response.create",
                                     "response": {
                                         "modalities": ["audio", "text"],
-                                        "voice": "shimmer"
+                                        "voice": "shimmer",
+                                        "instructions": (
+                                            f"Say EXACTLY and ONLY this sentence, word for word, nothing before it and nothing after it: "
+                                            f'"{hardcoded_greeting}"'
+                                        )
                                     }
                                 })
                             )
-                            logger.info("[GREETING] Hardcoded German opening sent")
+                            logger.info("[GREETING] Sent")
                         except Exception as e:
-                            logger.error(f"[GREETING] Failed to send hardcoded greeting: {e}")
-                            # Fallback to assistant prompt method
-                            await send_assistant_prompt(
-                                "Start the call now with the default German greeting from the system instructions. "
-                                "Do not mention internal policies. After greeting, ask how you can help."
-                            )
-                        
+                            logger.error(f"[GREETING] Failed: {e}")
+
                         greeting_sent.set()
-                        logger.info("Initial greeting trigger sent")
+                        logger.debug("Greeting triggered")
 
                     async def inactivity_monitor() -> None:
                         nonlocal last_prompt_stage, last_user_activity_ts
@@ -299,7 +269,7 @@ class RTMiddleTier:
                         except asyncio.CancelledError:
                             return
                         except Exception:
-                            logger.exception("Inactivity monitor failed")
+                            logger.exception("Inactivity monitor error")
                             return
                     async def from_client_to_server():
                         nonlocal session_id
@@ -308,21 +278,30 @@ class RTMiddleTier:
                                 try:
                                     data = json.loads(msg)
                                 except JSONDecodeError:
-                                    logger.warning("Non-JSON frame received from ACS websocket (ignored)")
+                                    logger.debug("Non-JSON from ACS (ignored)")
+                                    continue
+
+                                # Once the AI has said goodbye and requested hangup,
+                                # stop forwarding any more caller audio to OpenAI.
+                                # This prevents the AI from generating new responses
+                                # (e.g. reverting to German) after the call is over.
+                                if call_end_requested.is_set():
                                     continue
 
                                 if isinstance(data, dict):
                                     kind = data.get("kind")
-                                    logger.debug("ACS -> received kind: %s", kind)
                                     
-                                    # If session_id is not known yet, try to resolve it from metadata
+                                    # If session_id not known yet, resolve from metadata
                                     if not session_id and kind == "metadata":
                                         call_conn_id = data.get("metadata", {}).get("callConnectionId")
                                         if call_conn_id:
                                             session_obj = session_manager.get_session_by_call_connection_id(call_conn_id)
                                             if session_obj:
                                                 session_id = session_obj.session_id
-                                                logger.info(f"Resolved session_id {session_id} from callConnectionId {call_conn_id}")
+                                                logger.debug(f"Resolved session {session_id[:8]}...")
+
+                                    if kind == "AudioData":
+                                        last_user_activity_ts = loop.time()
 
                                 if is_acs_audio_stream:
                                     data = transform_acs_to_openai_format(data, self.model, self.system_message, self.temperature, self.max_tokens, self.disable_audio, self.selected_voice)
@@ -331,53 +310,51 @@ class RTMiddleTier:
                                         session_initialized.set()
                                     await target_ws.send_str(json.dumps(data))
                         except asyncio.CancelledError:
-                            logger.info("Client to server forwarding cancelled")
+                            logger.debug("Client→server cancelled")
                             return
                         except Exception as e:
-                            logger.exception("Error in client to server forwarding")
+                            logger.exception("Client→server error")
                             return
                             
                     # --- TURN DETECTION CONFIGURATION ---
                     # Delay after speech stops before AI can respond (seconds)
-                    TURN_DETECTION_DELAY = 0.5  # 300ms delay to prevent interrupting
+                    TURN_DETECTION_DELAY = 0.0  # OpenAI server_vad silence_duration_ms=600 already handles turn timing
                     speech_stop_time = 0.0
+                    unsuppress_scheduled = False  # Flag to prevent duplicate scheduling
                     # --- END TURN DETECTION CONFIG ---
 
                     async def from_server_to_client():
                         nonlocal last_user_activity_ts, last_prompt_stage, session_id
-                        nonlocal suppress_agent_audio, cancel_sent_for_current_turn, response_active, speech_stop_time
+                        nonlocal suppress_agent_audio, cancel_sent_for_current_turn, response_active, speech_stop_time, unsuppress_scheduled
                         try:
                             async for msg in target_ws:
                                 if msg.type == aiohttp.WSMsgType.TEXT:
                                     original_data = json.loads(msg.data)
                                     event_type = original_data.get("type")
-                                    logger.info(f"[OPENAI MSG] Type: {event_type}")
-                                    
-                                    # Log error details
-                                    if event_type == "error":
-                                        logger.error(f"[OPENAI ERROR] Full error: {original_data}")
-                                    
-                                    # Log transcription events
-                                    if "transcription" in str(event_type).lower():
-                                        logger.info(f"[TRANSCRIPTION EVENT] {original_data}")
-
-                                    # Update activity on VAD / transcripts
+                                    # Log only essential conversation events (not every message)
                                     event_type = original_data.get("type")
                                     
-                                    # Track response state to avoid response_cancel_not_active errors
+                                    # Log error details — suppress known harmless errors as DEBUG
+                                    if event_type == "error":
+                                        _err_code = original_data.get("error", {}).get("code", "")
+                                        if _err_code == "response_cancel_not_active":
+                                            logger.debug(f"[OPENAI] response_cancel_not_active (expected)")
+                                        else:
+                                            logger.error(f"[OPENAI ERROR] {_err_code}: {original_data.get('error', {}).get('message', 'Unknown error')}")
+                                    
+                                    # Track response state (debug only)
                                     if event_type == "response.created":
                                         response_active = True
-                                        logger.debug("Response created - response_active=True")
+                                        logger.debug("Response created")
                                     elif event_type in ("response.done", "response.cancelled"):
                                         response_active = False
-                                        logger.debug("Response ended - response_active=False")
+                                        logger.debug("Response ended")
                                     
                                     elif event_type == "session.updated":
-                                        logger.info("[SESSION] OpenAI confirmed session.updated — transcription active")
+                                        logger.debug("Session updated — transcription active")
                                         session_confirmed.set()
 
                                     elif event_type == "response.function_call_arguments.done":
-                                        logger.info(f"[FUNCTION CALL] Received: {original_data}")
                                         _call_id = original_data.get("call_id")
                                         _func_name = original_data.get("name")
                                         try:
@@ -401,17 +378,17 @@ class RTMiddleTier:
                                                             "response": {
                                                                 "modalities": ["audio", "text"],
                                                                 "tool_choice": "none",
+                                                                "max_output_tokens": 40,
                                                                 "instructions": (
-                                                                    "Say ONE brief sentence in the same language as the caller. "
-                                                                    "German: 'Einen Moment bitte, ich prüfe das kurz für Sie nach.' "
-                                                                    "English: 'One moment please, let me check that for you.' "
-                                                                    "Say ONLY this one sentence. Do NOT call any function tools."
+                                                                    "Say EXACTLY ONE short sentence: 'One moment please.' "
+                                                                    "or 'Einen Moment bitte.' (match caller's language). "
+                                                                    "Then STOP. Say NOTHING else. Do NOT list anything. Do NOT guess results."
                                                                 )
                                                             }
                                                         }))
-                                                        logger.info(f"[HOLDING] Sent holding message for {__func_name}")
+                                                        logger.info(f"[HOLDING] {__func_name}")
                                                     except Exception as __he:
-                                                        logger.debug(f"[HOLDING] Could not send holding message: {__he}")
+                                                        logger.debug(f"[HOLDING] Could not send: {__he}")
 
                                             if __func_name == "get_available_doctors":
                                                 __doctors = []
@@ -428,6 +405,9 @@ class RTMiddleTier:
                                                             pass
 
                                                     __extra = (os.getenv("EPAAD_EXTRA_CALENDAR_IDS") or "").strip()
+                                                    # Cache calendar_id -> name so _phonebook_update skips an extra GET /calendars
+                                                    for __d in __doctors:
+                                                        self._doctor_cache[__d["calendar_id"]] = __d["doctor_name"]
                                                     if __extra:
                                                         for __part in __extra.split(","):
                                                             if __part.strip():
@@ -509,13 +489,13 @@ class RTMiddleTier:
 
                                                     if __is_new_patient or __is_referred or __issue_count >= 2:
                                                         __appointment_type_id = 65
-                                                        logger.info(f"[BOOKING] Selected appointment type 65 (30 min)")
+                                                        logger.info(f"[BOOKING] Type 65 (30 min)")
                                                     elif __issue_count == 1:
                                                         __appointment_type_id = 63
-                                                        logger.info(f"[BOOKING] Selected appointment type 63 (20 min)")
+                                                        logger.info(f"[BOOKING] Type 63 (20 min)")
                                                     else:
                                                         __appointment_type_id = 61
-                                                        logger.info(f"[BOOKING] Selected appointment type 61 (15 min)")
+                                                        logger.info(f"[BOOKING] Type 61 (15 min)")
                                                     # --- END APPOINTMENT TYPE SELECTION ---
 
                                                     __f_name = __args.get("patient_first_name")
@@ -541,7 +521,7 @@ class RTMiddleTier:
                                                                             __gender = "male"
                                                                         elif __g in ("w", "f", "weiblich", "female", "frau"):
                                                                             __gender = "female"
-                                                                        logger.info(f"[GENDER] Inferred '{__gender}' from phonebook Geschlecht='{__pb_match.gender}'")
+                                                                        logger.info(f"[GENDER] From phonebook: '{__gender}'")
                                                         except Exception as __ge:
                                                             logger.warning(f"[GENDER] Phonebook gender lookup failed: {__ge}")
 
@@ -577,87 +557,127 @@ class RTMiddleTier:
                                                     __res = await epaad_client.create_event(__args.get("calendar_id"), __event)
                                                     __onedoc_key = __res.get("onedoc_key") or __res.get("onedocKey") or __res.get("key") if isinstance(__res, dict) else None
                                                     if __onedoc_key:
-                                                        logger.info(f"[BOOKING SUCCESS] Slot: {__args.get('slot_iso')}, Reference: {__onedoc_key}")
+                                                        logger.info(f"[BOOKING SUCCESS] {__args.get('slot_iso')[:10]} ref:{__onedoc_key[:8]}...")
                                                         __result = json.dumps({"status": "success", "booking_reference": __onedoc_key, "instruction": "DO NOT speak the booking_reference to the caller."})
 
                                                         # --- PHONEBOOK INTEGRATION (fire-and-forget) ---
+                                                        # Capture values from outer scope into local names
+                                                        # to avoid Python name-mangling issues inside nested closures.
+                                                        _pb_phone = __phone
+                                                        _pb_f_name = __f_name
+                                                        _pb_l_name = __l_name
+                                                        _pb_dob = __dob
+                                                        _pb_gender_raw = __gender
+                                                        _pb_args = dict(__args)  # shallow copy
+                                                        _pb_session_id = session_id
+
                                                         async def _phonebook_update():
                                                             try:
                                                                 from utils.phonebook_lookup import get_phonebook_lookup, save_phonebook_to_blob
-                                                                __lookup = get_phonebook_lookup()
-                                                                if __lookup:
-                                                                    __existing = __lookup.lookup_by_phone(__phone)
-                                                                    if not __existing:
-                                                                        # Gender: M / W for phonebook format
-                                                                        __pb_gender = "M" if __gender == "male" else ("W" if __gender == "female" else "")
+                                                                pb_lookup = get_phonebook_lookup()
+                                                                if not pb_lookup:
+                                                                    return
 
-                                                                        # Date: MM/DD/YYYY for phonebook format
-                                                                        __birth_raw = __dob[:10] if __dob else ""
-                                                                        if __birth_raw:
-                                                                            try:
-                                                                                __bd_obj = datetime.strptime(__birth_raw, "%Y-%m-%d")
-                                                                                __birth_fmt = __bd_obj.strftime("%m/%d/%Y")
-                                                                            except Exception:
-                                                                                __birth_fmt = __birth_raw
+                                                                # Get ACS incoming caller number
+                                                                acs_num = _pb_phone
+                                                                try:
+                                                                    upd_sess = session_manager.active_sessions.get(_pb_session_id)
+                                                                    if upd_sess and upd_sess.participants:
+                                                                        acs_num = upd_sess.participants[0].get("phone_number") or _pb_phone
+                                                                except Exception:
+                                                                    pass
+
+                                                                # --- Build patient_data (used for BOTH add and update) ---
+                                                                pb_gender = "M" if _pb_gender_raw == "male" else ("W" if _pb_gender_raw == "female" else "")
+
+                                                                birth_raw = _pb_dob[:10] if _pb_dob else ""
+                                                                birth_fmt = ""
+                                                                if birth_raw:
+                                                                    try:
+                                                                        birth_fmt = datetime.strptime(birth_raw, "%Y-%m-%d").strftime("%m/%d/%Y")
+                                                                    except Exception:
+                                                                        birth_fmt = birth_raw
+
+                                                                lang_map = {
+                                                                    "de": "Deutsch", "en": "Englisch", "fr": "Französisch",
+                                                                    "it": "Italienisch", "sq": "Albanisch", "tr": "Türkisch",
+                                                                    "ar": "Arabisch", "ru": "Russisch", "es": "Spanisch",
+                                                                    "pt": "Portugiesisch", "pl": "Polnisch", "hr": "Kroatisch",
+                                                                    "sr": "Serbisch", "bs": "Bosnisch", "ro": "Rumänisch",
+                                                                    "nl": "Niederländisch", "uk": "Ukrainisch",
+                                                                    "ko": "Koreanisch", "zh": "Chinesisch", "ja": "Japanisch",
+                                                                    "fa": "Persisch", "ku": "Kurdisch", "so": "Somali",
+                                                                }
+                                                                pb_lang = lang_map.get(detected_conversation_language or "de", "Deutsch")
+
+                                                                st = _pb_args.get("street", "")
+                                                                st_no = _pb_args.get("street_number", "")
+                                                                pb_address = f"{st} {st_no}".strip() if st else st_no
+
+                                                                patient_data = {
+                                                                    "first_name": _pb_f_name,
+                                                                    "last_name": _pb_l_name,
+                                                                    "birth_date": birth_fmt,
+                                                                    "phone": _pb_phone,
+                                                                    "mobile": acs_num,
+                                                                    "gender": pb_gender,
+                                                                    "email": _pb_args.get("patient_email", ""),
+                                                                    "zip_code": _pb_args.get("zip_code", ""),
+                                                                    "city": _pb_args.get("city", ""),
+                                                                    "address": pb_address,
+                                                                    "doctor": "",
+                                                                    "comment": _pb_args.get("comment") or "AI Booking",
+                                                                    "language": pb_lang,
+                                                                }
+                                                                logger.info(f"[PHONEBOOK] Built patient_data: {patient_data}")
+
+                                                                # Look up doctor name — use in-memory cache first to avoid extra GET /calendars
+                                                                try:
+                                                                    _cal_id_int = int(_pb_args.get("calendar_id") or 0)
+                                                                    if _cal_id_int and _cal_id_int in self._doctor_cache:
+                                                                        patient_data["doctor"] = self._doctor_cache[_cal_id_int]
+                                                                    elif _cal_id_int:
+                                                                        cals = await epaad_client.get_calendars()
+                                                                        for cal in cals or []:
+                                                                            if int(cal.get("id")) == _cal_id_int:
+                                                                                prof = cal.get("professional") or {}
+                                                                                pf = (prof.get("firstName") or "").strip()
+                                                                                pl = (prof.get("lastName") or "").strip()
+                                                                                patient_data["doctor"] = f"Dr. {pf} {pl}".strip() if (pf or pl) else ""
+                                                                                break
+                                                                except Exception:
+                                                                    pass
+
+                                                                # --- Add or Update ---
+                                                                # Rule: update ONLY when phone + BOTH first AND last name all match.
+                                                                # If phone matches but the name is different, this is a different person
+                                                                # sharing the same number — add a NEW entry instead of overwriting.
+                                                                exact_match = pb_lookup.lookup_by_phone_and_name(acs_num, _pb_f_name, _pb_l_name)
+                                                                if exact_match:
+                                                                    logger.info(f"[PHONEBOOK] Exact match (phone+name) — updating {_pb_f_name} {_pb_l_name}")
+                                                                    updated = await asyncio.to_thread(pb_lookup.update_patient, acs_num, patient_data, _pb_f_name, _pb_l_name)
+                                                                    if updated:
+                                                                        uploaded = await asyncio.to_thread(save_phonebook_to_blob, pb_lookup.xlsx_path)
+                                                                        if uploaded:
+                                                                            logger.info(f"[PHONEBOOK] Updated {_pb_f_name} {_pb_l_name} locally and in Blob")
                                                                         else:
-                                                                            __birth_fmt = ""
-
-                                                                        # Language: ISO code -> German name
-                                                                        __lang_map = {
-                                                                            "de": "Deutsch", "en": "Englisch", "fr": "Französisch",
-                                                                            "it": "Italienisch", "sq": "Albanisch", "tr": "Türkisch",
-                                                                            "ar": "Arabisch", "ru": "Russisch", "es": "Spanisch",
-                                                                            "pt": "Portugiesisch", "pl": "Polnisch", "hr": "Kroatisch",
-                                                                            "sr": "Serbisch", "bs": "Bosnisch", "ro": "Rumänisch",
-                                                                            "nl": "Niederländisch", "uk": "Ukrainisch",
-                                                                            "ko": "Koreanisch", "zh": "Chinesisch", "ja": "Japanisch",
-                                                                            "fa": "Persisch", "ku": "Kurdisch", "so": "Somali",
-                                                                        }
-                                                                        __pb_lang = __lang_map.get(detected_conversation_language or "de", "Deutsch")
-
-                                                                        # Address: combine street + number
-                                                                        __st = __args.get("street", "")
-                                                                        __st_no = __args.get("street_number", "")
-                                                                        __pb_address = f"{__st} {__st_no}".strip() if __st else __st_no
-
-                                                                        __patient_data = {
-                                                                            "first_name": __f_name,
-                                                                            "last_name": __l_name,
-                                                                            "birth_date": __birth_fmt,
-                                                                            "phone": __phone,
-                                                                            "gender": __pb_gender,
-                                                                            "email": __args.get("patient_email", ""),
-                                                                            "zip_code": __args.get("zip_code", ""),
-                                                                            "city": __args.get("city", ""),
-                                                                            "address": __pb_address,
-                                                                            "doctor": "",
-                                                                            "comment": __args.get("comment") or "AI Booking",
-                                                                            "language": __pb_lang,
-                                                                        }
-                                                                        try:
-                                                                            __cals = await epaad_client.get_calendars()
-                                                                            for __c in __cals or []:
-                                                                                if int(__c.get("id")) == int(__args.get("calendar_id")):
-                                                                                    __p = __c.get("professional") or {}
-                                                                                    __pf = (__p.get("firstName") or "").strip()
-                                                                                    __pl = (__p.get("lastName") or "").strip()
-                                                                                    __patient_data["doctor"] = f"Dr. {__pf} {__pl}".strip() if (__pf or __pl) else ""
-                                                                                    break
-                                                                        except Exception:
-                                                                            pass
-                                                                        __added = __lookup.add_patient(__patient_data)
-                                                                        if __added:
-                                                                            __uploaded = save_phonebook_to_blob(__lookup.xlsx_path)
-                                                                            if __uploaded:
-                                                                                logger.info(f"[PHONEBOOK] New patient {__f_name} {__l_name} added and uploaded")
-                                                                            else:
-                                                                                logger.warning(f"[PHONEBOOK] Patient added locally but blob upload failed")
-                                                                        else:
-                                                                            logger.warning(f"[PHONEBOOK] Failed to add patient to phonebook")
+                                                                            logger.warning("[PHONEBOOK] Updated local, blob upload failed")
                                                                     else:
-                                                                        logger.info(f"[PHONEBOOK] Patient {__f_name} {__l_name} already exists")
-                                                            except Exception as __pe:
-                                                                logger.warning(f"[PHONEBOOK] Error during phonebook integration: {__pe}")
+                                                                        logger.warning("[PHONEBOOK] Failed to update existing patient")
+                                                                else:
+                                                                    # No exact match (new person or different name on same number) → add new row
+                                                                    logger.info(f"[PHONEBOOK] No exact match — adding new entry for {_pb_f_name} {_pb_l_name}")
+                                                                    added = await asyncio.to_thread(pb_lookup.add_patient, patient_data)
+                                                                    if added:
+                                                                        uploaded = await asyncio.to_thread(save_phonebook_to_blob, pb_lookup.xlsx_path)
+                                                                        if uploaded:
+                                                                            logger.info(f"[PHONEBOOK] Added {_pb_f_name} {_pb_l_name}")
+                                                                        else:
+                                                                            logger.warning("[PHONEBOOK] Added local, blob failed")
+                                                                    else:
+                                                                        logger.warning("[PHONEBOOK] Failed to add")
+                                                            except Exception as pe:
+                                                                logger.warning(f"[PHONEBOOK] Error during phonebook integration: {pe}")
                                                         asyncio.create_task(_phonebook_update())
                                                         # --- END PHONEBOOK INTEGRATION ---
 
@@ -668,16 +688,42 @@ class RTMiddleTier:
                                                     __result = json.dumps({"status": "error", "message": str(__e)})
 
                                             elif __func_name == "terminate_call":
-                                                logger.info("AI requested to terminate call.")
+                                                logger.info("[CALL END] AI requested hangup")
                                                 call_end_requested.set()
                                                 __result = json.dumps({"status": "success", "message": "Terminating call now."})
 
-                                            # Wait for any active holding response to finish before submitting function output
+                                            elif __func_name == "search_knowledge_base":
+                                                try:
+                                                    __query = __args.get("query", "")
+                                                    __results = await document_processor.search_knowledge_base(query=__query, k=5)
+                                                    if not __results:
+                                                        __result = json.dumps({"status": "no_results_found", "message": "No information found in the knowledge base."})
+                                                    else:
+                                                        __blocks = []
+                                                        for __r in __results:
+                                                            __content = (__r.get("content") or "").strip()
+                                                            if __content:
+                                                                __blocks.append(__content)
+                                                        __result = json.dumps({"status": "success", "information": "\n\n".join(__blocks)[:2000]})
+                                                except Exception as __e:
+                                                    logger.error(f"Error in search_knowledge_base: {__e}")
+                                                    __result = json.dumps({"status": "error", "message": str(__e)})
+
+                                            # Cancel any still-active holding response before sending tool output.
+                                            # This prevents the AI from saying "no slots available" (guess)
+                                            # then "actually I see slots" (real data) — the contradiction problem.
                                             if __func_name != "terminate_call":
-                                                __resp_wait = 0.0
-                                                while response_active and __resp_wait < 12.0:
-                                                    await asyncio.sleep(0.2)
-                                                    __resp_wait += 0.2
+                                                if response_active:
+                                                    try:
+                                                        await target_ws.send_str(json.dumps({"type": "response.cancel"}))
+                                                        logger.debug(f"[TOOL] Cancelled holding response before submitting {__func_name} result")
+                                                    except Exception:
+                                                        pass
+                                                    # Brief wait for cancel to be acknowledged
+                                                    __resp_wait = 0.0
+                                                    while response_active and __resp_wait < 2.0:
+                                                        await asyncio.sleep(0.1)
+                                                        __resp_wait += 0.1
 
                                             # Submit function output back to OpenAI
                                             await target_ws.send_str(json.dumps({
@@ -698,51 +744,52 @@ class RTMiddleTier:
                                         asyncio.create_task(_run_function_call(_call_id, _func_name, _fn_args))
 
                                     if event_type == "input_audio_buffer.speech_started":
+                                        # If the call is ending, ignore any new speech events
+                                        if call_end_requested.is_set():
+                                            continue
                                         last_user_activity_ts = loop.time()
                                         last_prompt_stage = 0
                                         suppress_agent_audio = True
 
-                                        # Always try to cancel — removed "and response_active" to avoid
-                                        # race conditions where response_active is briefly False
+                                        # Always try to cancel — even if response_active is False,
+                                        # audio may still be buffered in ACS playout queue.
                                         if not cancel_sent_for_current_turn:
                                             cancel_sent_for_current_turn = True
                                             try:
                                                 await target_ws.send_str(json.dumps({"type": "response.cancel"}))
-                                                logger.info("Barge-in: sent response.cancel")
+                                                logger.info("[BARGE-IN] Cancelled")
                                                 response_active = False
                                             except Exception:
-                                                logger.debug("Barge-in: response.cancel not needed (no active response)")
+                                                logger.debug("[BARGE-IN] No active response")
 
-                                        # Clear ACS playout buffer so already-buffered audio stops immediately
-                                        if session_id:
-                                            async def _clear_acs_buffer(_sid=session_id):
-                                                try:
-                                                    __sess = session_manager.active_sessions.get(_sid)
-                                                    if __sess and __sess.call_connection_id:
-                                                        from azure.communication.callautomation import CallAutomationClient
-                                                        __acs = CallAutomationClient.from_connection_string(config["acs_connection_string"])
-                                                        __conn = __acs.get_call_connection(__sess.call_connection_id)
-                                                        await asyncio.to_thread(__conn.cancel_all_media_operations)
-                                                        logger.info("[BARGE-IN] ACS buffer cleared")
-                                                except Exception as __be:
-                                                    logger.debug(f"[BARGE-IN] ACS buffer clear: {__be}")
-                                            asyncio.create_task(_clear_acs_buffer())
+                                        # Flush ACS playout buffer by sending StopAudio
+                                        try:
+                                            await ws.send_text(json.dumps({
+                                                "kind": "StopAudio"
+                                            }))
+                                            logger.debug("[BARGE-IN] StopAudio sent")
+                                        except Exception as _se:
+                                            logger.debug(f"[BARGE-IN] StopAudio failed: {_se}")
 
                                     if event_type in (
                                         "input_audio_buffer.speech_stopped",
                                         "input_audio_buffer.committed",
                                     ):
                                         # --- TURN DETECTION: Unsuppress in background to avoid blocking the message loop ---
-                                        _speech_stop_ts = loop.time()
-                                        logger.info(f"[TURN DETECTION] Speech stopped, scheduling unsuppress in {TURN_DETECTION_DELAY}s")
-                                        async def _unsuppress_after_delay(_ts=_speech_stop_ts):
-                                            nonlocal suppress_agent_audio, cancel_sent_for_current_turn
-                                            await asyncio.sleep(TURN_DETECTION_DELAY)
-                                            if loop.time() - _ts >= TURN_DETECTION_DELAY:
-                                                suppress_agent_audio = False
-                                                cancel_sent_for_current_turn = False
-                                                logger.info("[TURN DETECTION] Delay complete, AI can now respond")
-                                        asyncio.create_task(_unsuppress_after_delay())
+                                        # Only schedule if not already scheduled (prevents duplicate from both events firing)
+                                        if not unsuppress_scheduled:
+                                            unsuppress_scheduled = True
+                                            _speech_stop_ts = loop.time()
+                                            logger.info(f"[TURN] Speech stopped, wait {TURN_DETECTION_DELAY}s")
+                                            async def _unsuppress_after_delay(_ts=_speech_stop_ts):
+                                                nonlocal suppress_agent_audio, cancel_sent_for_current_turn, unsuppress_scheduled
+                                                await asyncio.sleep(TURN_DETECTION_DELAY)
+                                                if loop.time() - _ts >= TURN_DETECTION_DELAY:
+                                                    suppress_agent_audio = False
+                                                    cancel_sent_for_current_turn = False
+                                                    unsuppress_scheduled = False
+                                                    logger.debug("[TURN] AI can respond")
+                                            asyncio.create_task(_unsuppress_after_delay())
                                         # --- END TURN DETECTION ---
 
                                     if suppress_agent_audio and event_type == "response.audio.delta":
@@ -752,7 +799,6 @@ class RTMiddleTier:
                                     try:
                                         transcription_data = extract_transcription_from_openai_message(original_data)
                                         if transcription_data:
-                                            logger.debug(f"Transcription data extracted: {transcription_data}")
                                             last_user_activity_ts = loop.time()
                                             last_prompt_stage = 0
                                             # Log transcription asynchronously (don't block message flow)
@@ -764,20 +810,19 @@ class RTMiddleTier:
                                                         utterance_text=transcription_data.get("utterance_text", ""),
                                                         timestamp=transcription_data.get("timestamp")
                                                     )
-                                                    logger.info(f"[TRANSCRIPTION SAVED] Session: {session_id}, Speaker: {transcription_data.get('speaker')}")
+                                                    speaker = transcription_data.get("speaker")
+                                                    text = transcription_data.get("utterance_text", "")[:50]
+                                                    logger.info(f"[TRANSCRIPT] {speaker}: {text}...")
                                                 except Exception as e:
-                                                    logger.error(f"[TRANSCRIPTION ERROR] Failed to save transcription for session {session_id}: {e}")
-                                                    logger.exception(e)
+                                                    logger.error(f"[TRANSCRIPT ERROR] {e}")
 
                                             if transcription_data.get("speaker") == "customer":
                                                 utterance = transcription_data.get("utterance_text", "").strip()
-                                                # Skip very short / noise transcriptions (echo, background noise, etc.)
+                                                # Skip very short / noise transcriptions
                                                 if len(utterance) <= 2:
-                                                    logger.info(f"[NOISE FILTER] Skipping short customer transcript: '{utterance}'")
-                                                else:
-                                                    await maybe_update_kb_context(utterance)
+                                                    logger.debug(f"[NOISE] Skipped: '{utterance}'")
                                     except Exception as e:
-                                        logger.warning(f"Error processing transcription data: {e}")
+                                        logger.debug(f"Transcription processing error: {e}")
                                     
                                     # Transform for ACS if needed
                                     if is_acs_audio_stream:
@@ -791,10 +836,10 @@ class RTMiddleTier:
                                     logger.error(f"WebSocket error: {target_ws.exception()}")
                                     break
                         except asyncio.CancelledError:
-                            logger.info("Server to client forwarding cancelled")
+                            logger.debug("Server→client cancelled")
                             return
                         except Exception as e:
-                            logger.exception("Error in server to client forwarding")
+                            logger.exception("Server→client error")
                             return
 
                     try:
@@ -831,26 +876,19 @@ class RTMiddleTier:
                                 pass
                                 
                     except asyncio.CancelledError:
-                        logger.info("Forward messages operation cancelled")
+                        logger.debug("Forward messages cancelled")
                         raise
 
-                    logger.info(
-                        "OpenAI Realtime websocket closed (close_code=%s)",
-                        getattr(target_ws, "close_code", None),
-                    )
+                    logger.info(f"[WEBSOCKET] Closed (code={getattr(target_ws, 'close_code', None)})")
                         
             except asyncio.CancelledError:
-                logger.info("WebSocket session cancelled during reload")
+                logger.debug("WebSocket session cancelled")
                 raise
             except aiohttp.WSServerHandshakeError as e:
-                logger.error(
-                    "Azure OpenAI Realtime handshake failed (status=%s, message=%s)",
-                    getattr(e, "status", None),
-                    str(e),
-                )
+                logger.error(f"OpenAI handshake failed: {getattr(e, 'status', None)} - {e}")
                 raise
             except Exception as e:
-                logger.exception("Error in forward_messages")
+                logger.exception("forward_messages error")
                 raise
                 
 rtmt = RTMiddleTier()
