@@ -61,4 +61,15 @@ class AcsCaller:
 
         return await asyncio.to_thread(_answer_call_sync)
 
+    async def hang_up(self, call_connection_id: str):
+        """
+        Terminate the call for the given call connection ID.
+        """
+        client = CallAutomationClient.from_connection_string(self.acs_connection_string)
+        
+        def _hang_up_sync():
+            return client.hang_up(call_connection_id=call_connection_id, is_for_everyone=True)
+
+        return await asyncio.to_thread(_hang_up_sync)
+
 acs_caller = AcsCaller()

@@ -34,7 +34,7 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                 "output_audio_format": "pcm16",
                 "turn_detection": {
                     "type": 'server_vad',
-                    "threshold": 0.6,
+                    "threshold": 0.75,
                     "prefix_padding_ms": 200,
                     "silence_duration_ms": 600
                 },
@@ -58,7 +58,7 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                     {
                         "type": "function",
                         "name": "get_available_slots",
-                        "description": "Get a list of available appointment slots for a specific doctor on a specific date.",
+                        "description": "Get a list of available appointment slots for a specific doctor on a specific date. MANDATORY: You MUST NOT call this tool until the caller has specifically chosen a doctor or confirmed their preferred practitioner in Step A3.",
                         "parameters": {
                             "type": "object",
                             "properties": {

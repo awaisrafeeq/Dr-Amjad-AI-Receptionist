@@ -2,6 +2,8 @@ import os
 import re
 import tempfile
 import hashlib
+import threading
+import logging
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Any, List, Tuple
 
@@ -9,6 +11,7 @@ from dotenv import load_dotenv
 
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -224,8 +227,6 @@ class PhonebookLookup:
         with self._write_lock:
             try:
                 from openpyxl import load_workbook
-                import logging
-                logger = logging.getLogger(__name__)
                 logger.info(f"[PHONEBOOK] Attempting to add new patient to {self.xlsx_path} with data: {patient_data}")
                 
                 # Load workbook with write support
@@ -294,7 +295,6 @@ class PhonebookLookup:
                 return True
             
             except Exception as e:
-                import logger
                 logger.error(f"[PHONEBOOK] Error adding patient to phonebook: {e}")
                 return False
 
@@ -305,8 +305,6 @@ class PhonebookLookup:
         with self._write_lock:
             try:
                 from openpyxl import load_workbook
-                import logging
-                logger = logging.getLogger(__name__)
                 logger.info(f"[PHONEBOOK] Attempting to update patient {first_name} {last_name} with phone {phone} in {self.xlsx_path}")
                 
                 # Find the match to ensure they exist
@@ -419,7 +417,6 @@ class PhonebookLookup:
                 
                 return True
             except Exception as e:
-                import logger
                 logger.error(f"[PHONEBOOK] Error updating patient in phonebook: {e}")
                 return False
 

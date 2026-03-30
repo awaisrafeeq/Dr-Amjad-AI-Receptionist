@@ -91,12 +91,27 @@ class RTMiddleTier:
 
                     # Native Tool Calling Handlers will be here
 
+                    async def wait_for_response_idle(timeout: float = 2.0) -> bool:
+                        """Wait for any active response to finish or be cancelled."""
+                        nonlocal response_active
+                        if not response_active:
+                            return True
+                        
+                        _start = loop.time()
+                        while response_active and (loop.time() - _start) < timeout:
+                            await asyncio.sleep(0.05)
+                        
+                        # Even if flag is finally false, give OpenAI a tiny buffer to be truly "ready"
+                        if not response_active:
+                            await asyncio.sleep(0.1)
+                        return not response_active
+
                     async def send_assistant_prompt(instructions: str) -> None:
                         nonlocal response_active
                         if response_active:
                             try:
                                 await target_ws.send_str(json.dumps({"type": "response.cancel"}))
-                                response_active = False
+                                await wait_for_response_idle(timeout=1.5)
                             except Exception as e:
                                 logger.error(f"Failed to cancel active response: {e}")
 
@@ -314,7 +329,7 @@ class RTMiddleTier:
                     # --- END TURN DETECTION CONFIG ---
 
                     async def from_server_to_client():
-                        nonlocal last_user_activity_ts, last_prompt_stage, session_id
+                        nonlocal last_user_activity_ts, last_prompt_stage, session_id, detected_conversation_language
                         nonlocal suppress_agent_audio, cancel_sent_for_current_turn, response_active, speech_stop_time, unsuppress_scheduled
                         try:
                             async for msg in target_ws:
@@ -355,11 +370,12 @@ class RTMiddleTier:
                                         # Run all API work in a background task so the event loop stays
                                         # unblocked — audio frames from OpenAI continue to be forwarded
                                         # to ACS while the function executes, eliminating silence gaps.
-                                        async def _run_function_call(__call_id, __func_name, __args):
-                                            __result = ""
+                                        async def _run_function_call(_call_id, _func_name, _args):
+                                            nonlocal detected_conversation_language
+                                            _result = ""
 
                                             # Send brief holding message for slow functions so caller never hears silence
-                                            if __func_name in ("get_available_slots", "book_appointment", "get_available_doctors"):
+                                            if _func_name in ("get_available_slots", "book_appointment", "get_available_doctors"):
                                                 await asyncio.sleep(0.15)  # yield so response.done is processed first
                                                 if not response_active:
                                                     try:
@@ -370,17 +386,17 @@ class RTMiddleTier:
                                                                 "tool_choice": "none",
                                                                 "max_output_tokens": 40,
                                                                 "instructions": (
-                                                                    "Say EXACTLY ONE short sentence: 'One moment please.' "
-                                                                    "or 'Einen Moment bitte.' (match caller's language). "
+                                                                    f"Say EXACTLY ONE short sentence: 'One moment please.' "
+                                                                    f"in the language the caller is speaking (currently '{detected_conversation_language or 'de'}'). "
                                                                     "Then STOP. Say NOTHING else. Do NOT list anything. Do NOT guess results."
                                                                 )
                                                             }
                                                         }))
-                                                        logger.info(f"[HOLDING] {__func_name}")
+                                                        logger.info(f"[HOLDING] {_func_name}")
                                                     except Exception as __he:
                                                         logger.debug(f"[HOLDING] Could not send: {__he}")
 
-                                            if __func_name == "get_available_doctors":
+                                            if _func_name == "get_available_doctors":
                                                 __doctors = []
                                                 try:
                                                     __calendars = await epaad_client.get_calendars()
@@ -408,16 +424,16 @@ class RTMiddleTier:
                                                                 except Exception:
                                                                     pass
 
-                                                    __result = json.dumps(__doctors)
+                                                    _result = json.dumps(__doctors)
                                                 except Exception as __e:
                                                     logger.error(f"Error in get_available_doctors: {__e}")
-                                                    __result = json.dumps({"error": str(__e)})
+                                                    _result = json.dumps({"error": str(__e)})
 
-                                            elif __func_name == "get_available_slots":
+                                            elif _func_name == "get_available_slots":
                                                 try:
-                                                    __cal_id = __args.get("calendar_id")
-                                                    __target_date_str = __args.get("date")
-                                                    __tod = __args.get("time_of_day", "any")
+                                                    __cal_id = _args.get("calendar_id")
+                                                    __target_date_str = _args.get("date")
+                                                    __tod = _args.get("time_of_day", "any")
                                                     __target_day = date.fromisoformat(__target_date_str)
                                                     __start_dt = datetime.combine(__target_day, datetime.min.time())
                                                     __end_dt = datetime.combine(__target_day, datetime.max.time()).replace(microsecond=0)
@@ -438,20 +454,19 @@ class RTMiddleTier:
                                                     )
 
                                                     __slot_iso = [__s.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S") for __s in __slots][:10]
-                                                    __result = json.dumps({"available_slots": __slot_iso})
+                                                    _result = json.dumps({"available_slots": __slot_iso})
                                                 except Exception as __e:
                                                     logger.error(f"Error in get_available_slots: {__e}")
-                                                    __result = json.dumps({"error": str(__e)})
+                                                    _result = json.dumps({"error": str(__e)})
 
-                                            elif __func_name == "book_appointment":
+                                            elif _func_name == "book_appointment":
                                                 try:
-                                                    __dob = __args.get("patient_dob", "")
+                                                    __dob = _args.get("patient_dob", "")
                                                     if len(__dob) == 10:
                                                         __dob += "T00:00:00"
-
-                                                    __phone = __args.get("patient_phone")
-                                                    __visit_reason = __args.get("visit_reason", "")
-                                                    __comment = __args.get("comment", "")
+                                                    __phone = _args.get("patient_phone")
+                                                    __visit_reason = _args.get("visit_reason", "")
+                                                    __comment = _args.get("comment", "")
 
                                                     # --- APPOINTMENT TYPE SELECTION LOGIC ---
                                                     __appointment_type_id = 61
@@ -488,13 +503,13 @@ class RTMiddleTier:
                                                         logger.info(f"[BOOKING] Type 61 (15 min)")
                                                     # --- END APPOINTMENT TYPE SELECTION ---
 
-                                                    __f_name = __args.get("patient_first_name")
-                                                    __l_name = __args.get("patient_last_name")
+                                                    __f_name = _args.get("patient_first_name")
+                                                    __l_name = _args.get("patient_last_name")
                                                     if __f_name == "[REDACTED]" or __l_name == "[REDACTED]":
                                                         logging.getLogger("utils.rtmt").warning(f"[BOOKING WARN] Model sent [REDACTED] for name.")
 
                                                     # Map gender: prefer AI-detected voice gender, then phonebook fallback
-                                                    __gender = (__args.get("patient_gender") or "").lower()
+                                                    __gender = (_args.get("patient_gender") or "").lower()
                                                     if __gender not in ["male", "female"]:
                                                         __gender = "other"
                                                         try:
@@ -515,7 +530,7 @@ class RTMiddleTier:
                                                         except Exception as __ge:
                                                             logger.warning(f"[GENDER] Phonebook gender lookup failed: {__ge}")
 
-                                                    __city = __args.get("city", "")
+                                                    __city = _args.get("city", "")
                                                     __state = "BS" if "basel" in __city.lower() else ""
 
                                                     __full_comment = __visit_reason
@@ -523,7 +538,7 @@ class RTMiddleTier:
                                                         __full_comment = f"{__visit_reason} | {__comment}"
 
                                                     __event = {
-                                                        "startDateTime": __args.get("slot_iso"),
+                                                        "startDateTime": _args.get("slot_iso"),
                                                         "epaad_appointmenttype_id": __appointment_type_id,
                                                         "comment": __full_comment or "AI Booking",
                                                         "patient": {
@@ -532,23 +547,23 @@ class RTMiddleTier:
                                                             "birthDate": __dob,
                                                             "gender": __gender,
                                                             "address": {
-                                                                "street": __args.get("street", ""),
-                                                                "streetNumber": __args.get("street_number", ""),
-                                                                "zipCode": __args.get("zip_code", ""),
+                                                                "street": _args.get("street", ""),
+                                                                "streetNumber": _args.get("street_number", ""),
+                                                                "zipCode": _args.get("zip_code", ""),
                                                                 "city": __city,
                                                                 "state": __state,
                                                                 "country": "CH"
                                                             },
                                                             "privatePhoneNumber": __phone,
                                                             "mobilePhoneNumber": __phone,
-                                                            "email": __args.get("patient_email", "")
+                                                            "email": _args.get("patient_email", "")
                                                         }
                                                     }
-                                                    __res = await epaad_client.create_event(__args.get("calendar_id"), __event)
-                                                    __onedoc_key = __res.get("onedoc_key") or __res.get("onedocKey") or __res.get("key") if isinstance(__res, dict) else None
+                                                    _res = await epaad_client.create_event(_args.get("calendar_id"), __event)
+                                                    __onedoc_key = _res.get("onedoc_key") or _res.get("onedocKey") or _res.get("key") if isinstance(_res, dict) else None
                                                     if __onedoc_key:
-                                                        logger.info(f"[BOOKING SUCCESS] {__args.get('slot_iso')[:10]} ref:{__onedoc_key[:8]}...")
-                                                        __result = json.dumps({"status": "success", "booking_reference": __onedoc_key, "instruction": "DO NOT speak the booking_reference to the caller."})
+                                                        logger.info(f"[BOOKING SUCCESS] {_args.get('slot_iso')[:10]} ref:{__onedoc_key[:8]}...")
+                                                        _result = json.dumps({"status": "success", "booking_reference": __onedoc_key, "instruction": "DO NOT speak the booking_reference to the caller."})
 
                                                         # --- PHONEBOOK INTEGRATION (fire-and-forget) ---
                                                         # Capture values from outer scope into local names
@@ -558,10 +573,11 @@ class RTMiddleTier:
                                                         _pb_l_name = __l_name
                                                         _pb_dob = __dob
                                                         _pb_gender_raw = __gender
-                                                        _pb_args = dict(__args)  # shallow copy
+                                                        _pb_args = dict(_args)  # shallow copy
                                                         _pb_session_id = session_id
 
                                                         async def _phonebook_update():
+                                                            nonlocal detected_conversation_language
                                                             try:
                                                                 from utils.phonebook_lookup import get_phonebook_lookup, save_phonebook_to_blob
                                                                 pb_lookup = get_phonebook_lookup()
@@ -672,15 +688,15 @@ class RTMiddleTier:
                                                         # --- END PHONEBOOK INTEGRATION ---
 
                                                     else:
-                                                        __result = json.dumps({"status": "success", "message": "Appointment booked but no reference generated."})
+                                                        _result = json.dumps({"status": "success", "message": "Appointment booked but no reference generated."})
                                                 except Exception as __e:
                                                     logger.error(f"Error in book_appointment: {__e}")
-                                                    __result = json.dumps({"status": "error", "message": str(__e)})
+                                                    _result = json.dumps({"status": "error", "message": str(__e)})
 
-                                            elif __func_name == "terminate_call":
+                                            elif _func_name == "terminate_call":
                                                 logger.info("[CALL END] AI requested hangup")
                                                 call_end_requested.set()
-                                                __result = json.dumps({"status": "success", "message": "Terminating call now."})
+                                                _result = json.dumps({"status": "success", "message": "Terminating call now."})
                                                 
                                                 # Actually hang up the ACS call
                                                 try:
@@ -692,51 +708,49 @@ class RTMiddleTier:
                                                 except Exception as _hangup_err:
                                                     logger.error(f"[CALL END] Hangup failed: {_hangup_err}")
 
-                                            elif __func_name == "search_knowledge_base":
+                                            elif _func_name == "search_knowledge_base":
                                                 try:
-                                                    __query = __args.get("query", "")
-                                                    __results = await document_processor.search_knowledge_base(query=__query, k=5)
-                                                    if not __results:
-                                                        __result = json.dumps({"status": "no_results_found", "message": "No information found in the knowledge base."})
+                                                    __query = _args.get("query", "")
+                                                    _results = await document_processor.search_knowledge_base(query=__query, k=5)
+                                                    if not _results:
+                                                        _result = json.dumps({"status": "no_results_found", "message": "No information found in the knowledge base."})
                                                     else:
                                                         __blocks = []
-                                                        for __r in __results:
+                                                        for __r in _results:
                                                             __content = (__r.get("content") or "").strip()
                                                             if __content:
                                                                 __blocks.append(__content)
-                                                        __result = json.dumps({"status": "success", "information": "\n\n".join(__blocks)[:2000]})
+                                                        _result = json.dumps({"status": "success", "information": "\n\n".join(__blocks)[:2000]})
                                                 except Exception as __e:
                                                     logger.error(f"Error in search_knowledge_base: {__e}")
-                                                    __result = json.dumps({"status": "error", "message": str(__e)})
+                                                    _result = json.dumps({"status": "error", "message": str(__e)})
 
                                             # Cancel any still-active holding response before sending tool output.
                                             # This prevents the AI from saying "no slots available" (guess)
                                             # then "actually I see slots" (real data) — the contradiction problem.
-                                            if __func_name != "terminate_call":
+                                            if _func_name != "terminate_call":
                                                 if response_active:
                                                     try:
                                                         await target_ws.send_str(json.dumps({"type": "response.cancel"}))
-                                                        logger.debug(f"[TOOL] Cancelled holding response before submitting {__func_name} result")
+                                                        logger.debug(f"[TOOL] Cancelled holding response before submitting {_func_name} result")
                                                     except Exception:
                                                         pass
-                                                    # Brief wait for cancel to be acknowledged
-                                                    __resp_wait = 0.0
-                                                    while response_active and __resp_wait < 2.0:
-                                                        await asyncio.sleep(0.1)
-                                                        __resp_wait += 0.1
+                                                        await wait_for_response_idle(timeout=1.5)
 
                                             # Submit function output back to OpenAI
                                             await target_ws.send_str(json.dumps({
                                                 "type": "conversation.item.create",
                                                 "item": {
                                                     "type": "function_call_output",
-                                                    "call_id": __call_id,
-                                                    "output": __result
+                                                    "call_id": _call_id,
+                                                    "output": _result
                                                 }
                                             }))
 
                                             # Trigger agent to respond (if not terminating)
                                             if not call_end_requested.is_set():
+                                                # Ensure any previous response (like 'One moment please') is dead
+                                                await wait_for_response_idle(timeout=1.5)
                                                 await target_ws.send_str(json.dumps({
                                                     "type": "response.create"
                                                 }))
@@ -821,6 +835,16 @@ class RTMiddleTier:
                                                 # Skip very short / noise transcriptions
                                                 if len(utterance) <= 2:
                                                     logger.debug(f"[NOISE] Skipped: '{utterance}'")
+                                                else:
+                                                    # Run language detection (CPU bound) in a thread to avoid blocking main loop
+                                                    if detect_lang and len(utterance) > 12:  # only detect on reasonable length
+                                                        try:
+                                                            _lang = await asyncio.to_thread(detect_lang, utterance)
+                                                            if _lang and _lang != detected_conversation_language:
+                                                                detected_conversation_language = _lang
+                                                                logger.debug(f"[LANG] Detected change to: {_lang}")
+                                                        except Exception:
+                                                            pass
                                     except Exception as e:
                                         logger.debug(f"Transcription processing error: {e}")
                                     
