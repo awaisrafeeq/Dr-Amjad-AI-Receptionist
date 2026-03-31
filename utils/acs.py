@@ -68,7 +68,7 @@ class AcsCaller:
         client = CallAutomationClient.from_connection_string(self.acs_connection_string)
         
         def _hang_up_sync():
-            return client.hang_up(call_connection_id=call_connection_id, is_for_everyone=True)
+            return client.get_call_connection(call_connection_id).hang_up(is_for_everyone=True)
 
         return await asyncio.to_thread(_hang_up_sync)
 

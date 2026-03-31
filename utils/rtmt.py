@@ -654,34 +654,18 @@ class RTMiddleTier:
                                                                 except Exception:
                                                                     pass
 
-                                                                # --- Add or Update ---
-                                                                # Rule: update ONLY when phone + BOTH first AND last name all match.
-                                                                # If phone matches but the name is different, this is a different person
-                                                                # sharing the same number — add a NEW entry instead of overwriting.
+                                                                # --- Add only (never overwrite existing patient) ---
+                                                                # Rule: if phone + first + last name all match → patient already
+                                                                # exists, skip. Only add when this is a genuinely new person.
                                                                 exact_match = pb_lookup.lookup_by_phone_and_name(acs_num, _pb_f_name, _pb_l_name)
                                                                 if exact_match:
-                                                                    logger.info(f"[PHONEBOOK] Exact match (phone+name) — updating {_pb_f_name} {_pb_l_name}")
-                                                                    updated = await asyncio.to_thread(pb_lookup.update_patient, acs_num, patient_data, _pb_f_name, _pb_l_name)
-                                                                    if updated:
-                                                                        uploaded = await asyncio.to_thread(save_phonebook_to_blob, pb_lookup.xlsx_path)
-                                                                        if uploaded:
-                                                                            logger.info(f"[PHONEBOOK] Updated {_pb_f_name} {_pb_l_name} locally and in Blob")
-                                                                        else:
-                                                                            logger.warning("[PHONEBOOK] Updated local, blob upload failed")
-                                                                    else:
-                                                                        logger.warning("[PHONEBOOK] Failed to update existing patient")
+                                                                    logger.info(f"[PHONEBOOK] Patient already exists — skipping for {_pb_f_name} {_pb_l_name}")
                                                                 else:
-                                                                    # No exact match (new person or different name on same number) → add new row
-                                                                    logger.info(f"[PHONEBOOK] No exact match — adding new entry for {_pb_f_name} {_pb_l_name}")
+                                                                    # New person (or different name on same number) → add new row
+                                                                    logger.info(f"[PHONEBOOK] New patient — adding entry for {_pb_f_name} {_pb_l_name}")
                                                                     added = await asyncio.to_thread(pb_lookup.add_patient, patient_data)
-                                                                    if added:
-                                                                        uploaded = await asyncio.to_thread(save_phonebook_to_blob, pb_lookup.xlsx_path)
-                                                                        if uploaded:
-                                                                            logger.info(f"[PHONEBOOK] Added {_pb_f_name} {_pb_l_name}")
-                                                                        else:
-                                                                            logger.warning("[PHONEBOOK] Added local, blob failed")
-                                                                    else:
-                                                                        logger.warning("[PHONEBOOK] Failed to add")
+                                                                    if not added:
+                                                                        logger.warning("[PHONEBOOK] Failed to add new patient")
                                                             except Exception as pe:
                                                                 logger.warning(f"[PHONEBOOK] Error during phonebook integration: {pe}")
                                                         asyncio.create_task(_phonebook_update())

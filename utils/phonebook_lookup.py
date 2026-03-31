@@ -154,7 +154,7 @@ class PhonebookLookup:
         self.xlsx_path = xlsx_path
         self._index: Dict[str, List[PhonebookMatch]] = {}
         self._loaded = False
-        self._write_lock = threading.Lock()
+        self._write_lock = threading.RLock()
 
     def load(self) -> None:
         with self._write_lock:
@@ -285,6 +285,12 @@ class PhonebookLookup:
                 # Save workbook
                 wb.save(self.xlsx_path)
                 logger.info(f"[PHONEBOOK] Successfully appended and saved new patient to {self.xlsx_path}")
+
+                # Upload to blob immediately so data is never lost if async task is cut off
+                if save_phonebook_to_blob(self.xlsx_path):
+                    logger.info("[PHONEBOOK] Blob upload succeeded after add_patient")
+                else:
+                    logger.warning("[PHONEBOOK] Blob upload failed after add_patient — data saved locally only")
                 
                 # Reload the index
                 self._loaded = False
@@ -409,6 +415,12 @@ class PhonebookLookup:
                 
                 wb.save(self.xlsx_path)
                 logger.info(f"[PHONEBOOK] Successfully updated patient in {self.xlsx_path}")
+
+                # Upload to blob immediately so data is never lost if async task is cut off
+                if save_phonebook_to_blob(self.xlsx_path):
+                    logger.info("[PHONEBOOK] Blob upload succeeded after update_patient")
+                else:
+                    logger.warning("[PHONEBOOK] Blob upload failed after update_patient — data saved locally only")
                 
                 self._loaded = False
                 self._index.clear()
