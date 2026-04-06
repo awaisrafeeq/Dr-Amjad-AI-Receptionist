@@ -138,11 +138,22 @@ async def handle_callback(contextId: str, request: Request):
 
             if event.type == "Microsoft.Communication.CallConnected":
                 generic_event["details"]["operationContext"] = event.data.get("operationContext")
-                
+                logger.info(
+                    f"[CALL CONNECTED] session={current_session_id[:8]}, "
+                    f"call_connection_id={call_connection_id}"
+                )
+
                 await session_manager.log_event(
                     session_id=current_session_id,
                     event_data=generic_event
                 )
+
+                # Verify call_connection_id was stored on session
+                _verify_sess = session_manager.get_session(current_session_id)
+                if _verify_sess:
+                    logger.info(f"[CALL CONNECTED] Verified session.call_connection_id={_verify_sess.call_connection_id}")
+                else:
+                    logger.error(f"[CALL CONNECTED] Session {current_session_id[:8]} NOT FOUND after log_event!")
             
             elif event.type == "Microsoft.Communication.ParticipantsUpdated":
                 generic_event["details"]["participants"] = event.data.get("participants")
@@ -198,21 +209,34 @@ async def handle_callback(contextId: str, request: Request):
                 generic_event["details"]["operationContext"] = event.data.get("operationContext")
                 generic_event["details"]["resultInformation"] = event.data.get("resultInformation")
                 generic_event["status"] = 'disconnected'
-                
-                # Send transcript email
-                try:
-                    await session_manager.send_transcript_email(
-                        session_id=contextId,
-                        caller_phone=caller_id if caller_id else None
-                    )
-                except Exception as email_error:
-                    logger.error(f"Email send error: {email_error}")
-                
-                # THEN end the session
-                await session_manager.end_session(
-                    session_id=contextId,
-                    event_data=generic_event
+                _result_info = event.data.get("resultInformation", {})
+                logger.info(
+                    f"[CALL DISCONNECTED] session={contextId[:8]}, "
+                    f"call_connection_id={call_connection_id}, "
+                    f"reason_code={_result_info.get('subCode')}, "
+                    f"message={_result_info.get('message', 'N/A')}"
                 )
+
+                # Guard: skip if WebSocket handler already started cleanup for this session
+                if contextId in session_manager._cleanup_in_progress:
+                    logger.info(f"[CALLBACK] Session {contextId[:8]} cleanup already in progress — skipping")
+                else:
+                    session_manager._cleanup_in_progress.add(contextId)
+
+                    # Send transcript email
+                    try:
+                        await session_manager.send_transcript_email(
+                            session_id=contextId,
+                            caller_phone=caller_id if caller_id else None
+                        )
+                    except Exception as email_error:
+                        logger.error(f"Email send error: {email_error}")
+
+                    # THEN end the session
+                    await session_manager.end_session(
+                        session_id=contextId,
+                        event_data=generic_event
+                    )
 
 
     except Exception as ex:
@@ -255,7 +279,37 @@ async def websocket_handler_acs(websocket: WebSocket):
         try:
             await websocket.close()
         except:
-            pass  
+            pass
+        # Safety-net cleanup: if CallDisconnected hasn't already handled this session,
+        # send transcript email and end the session so it doesn't linger forever.
+        if current_session_id and current_session_id in session_manager.active_sessions:
+            if current_session_id not in session_manager._cleanup_in_progress:
+                session_manager._cleanup_in_progress.add(current_session_id)
+                logger.info(f"[WS CLEANUP] Session {current_session_id[:8]} still active — cleaning up")
+                try:
+                    _sess = session_manager.active_sessions.get(current_session_id)
+                    _caller_phone = (
+                        _sess.participants[0]["phone_number"]
+                        if _sess and _sess.participants else None
+                    )
+                    await session_manager.send_transcript_email(
+                        session_id=current_session_id,
+                        caller_phone=_caller_phone,
+                    )
+                except BaseException as _email_err:
+                    # BaseException catches CancelledError too (server shutdown)
+                    logger.error(f"[WS CLEANUP] Email error: {_email_err}")
+                try:
+                    await session_manager.end_session(
+                        session_id=current_session_id,
+                        event_data={
+                            "event_type": "WebSocketDisconnected",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "status": "disconnected",
+                        },
+                    )
+                except BaseException as _end_err:
+                    logger.error(f"[WS CLEANUP] End session error: {_end_err}")
     
     # Try to get session context from query parameters or headers
     # session_id = websocket.query_params.get("session_id")

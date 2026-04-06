@@ -87,7 +87,11 @@ class RTMiddleTier:
                     suppress_agent_audio = False
                     cancel_sent_for_current_turn = False
                     response_active = False
+                    _dynamic_tasks: list = []  # tracks fire-and-forget tasks for cleanup
 
+                    # Per-session doctor validation: get_available_slots is blocked
+                    # until get_available_doctors has been called and returned valid IDs.
+                    _valid_calendar_ids: set = set()  # populated by get_available_doctors
 
                     # Native Tool Calling Handlers will be here
 
@@ -130,6 +134,40 @@ class RTMiddleTier:
                         except Exception:
                             logger.exception("Failed to send response.create")
 
+                    async def _do_acs_hangup(reason: str) -> bool:
+                        """Centralized ACS hangup with full diagnostic logging.
+                        Returns True if hangup was sent, False otherwise."""
+                        _tag = f"[HANGUP:{reason}]"
+                        logger.info(f"{_tag} Attempting ACS hangup for session={session_id}")
+
+                        if not session_id:
+                            logger.error(f"{_tag} FAILED — session_id is None, cannot hang up")
+                            return False
+
+                        _sess = session_manager.active_sessions.get(session_id)
+                        if not _sess:
+                            logger.error(f"{_tag} FAILED — session {session_id[:8]} not found in active_sessions")
+                            return False
+
+                        _conn_id = _sess.call_connection_id
+                        if not _conn_id:
+                            logger.error(
+                                f"{_tag} FAILED — session {session_id[:8]} has no call_connection_id. "
+                                f"Session status={_sess.status}, event_count={_sess.event_count}, "
+                                f"server_call_id={_sess.server_call_id}, correlation_id={_sess.correlation_id}"
+                            )
+                            return False
+
+                        try:
+                            from utils.acs import acs_caller as _acs_ref
+                            logger.info(f"{_tag} Sending hang_up for call_connection_id={_conn_id[:12]}...")
+                            await _acs_ref.hang_up(_conn_id)
+                            logger.info(f"{_tag} SUCCESS — ACS hangup sent for session={session_id[:8]}")
+                            return True
+                        except Exception as _hup_err:
+                            logger.error(f"{_tag} EXCEPTION during hang_up: {_hup_err}", exc_info=True)
+                            return False
+
                     async def send_initial_greeting() -> None:
                         if not is_acs_audio_stream:
                             return
@@ -158,13 +196,11 @@ class RTMiddleTier:
                         # --- INJECT PHONEBOOK MATCH INTO SESSION INSTRUCTIONS ---
                         # If the caller was recognised in the internal phonebook, tell OpenAI
                         # about it now so it can silently use their details during the call.
-                        _pb_match_lang = None
                         try:
                             if session_id:
                                 _pb_sess = session_manager.active_sessions.get(session_id)
                                 _pb_match = _pb_sess.phonebook_match if _pb_sess else None
                                 if _pb_match:
-                                    _pb_match_lang = _pb_match.get('language')
                                     _pb_lines = [
                                         "[INTERNAL — PHONEBOOK DATA FOR THIS PHONE NUMBER]",
                                         f"First name: {_pb_match.get('first_name') or 'MISSING'}",
@@ -202,11 +238,8 @@ class RTMiddleTier:
                         # Use response.create with explicit instructions so OpenAI
                         # actually SPEAKS the exact sentence rather than treating it
                         # as already-spoken history (which conversation.item.create does).
+                        # ALWAYS greet in German — prompt mandates this. Language switch only on explicit caller request.
                         hardcoded_greeting = "MedCenter Volta, Sie sprechen mit Kaya, der digitalen Assistentin. Wie kann ich Ihnen behilflich sein?"
-                        if _pb_match_lang:
-                            _lang_lower = _pb_match_lang.lower()
-                            if "en" in _lang_lower or "english" in _lang_lower:
-                                hardcoded_greeting = "MedCenter Volta, you are speaking with Kaya, the digital assistant. How may I help you?"
 
                         try:
                             await target_ws.send_str(
@@ -242,40 +275,69 @@ class RTMiddleTier:
                         try:
                             while not call_end_requested.is_set():
                                 await asyncio.sleep(1.0)
+
+                                # Detect externally ended session (e.g. CallDisconnected
+                                # arrived before the WS closed — the "ghost session" case).
+                                # Close the OpenAI WS so the forward loop exits cleanly.
+                                if session_id and session_id not in session_manager.active_sessions:
+                                    logger.warning(
+                                        f"[GHOST SESSION] Session {session_id[:8]} no longer in active_sessions "
+                                        f"— closing OpenAI WebSocket to stop ghost processing"
+                                    )
+                                    call_end_requested.set()
+                                    try:
+                                        await target_ws.close()
+                                    except Exception:
+                                        pass
+                                    return
+
                                 if not greeting_sent.is_set():
                                     continue
 
                                 idle_for = loop.time() - last_user_activity_ts
 
+                                _lang = detected_conversation_language or "de"
+                                _lang_instruction = f"Respond in the language the caller is speaking (currently '{_lang}'). "
+
                                 if idle_for >= hangup_after and last_prompt_stage < 3:
                                     last_prompt_stage = 3
+                                    logger.info(f"[INACTIVITY] {idle_for:.0f}s idle — initiating hangup for session={session_id}")
                                     await send_assistant_prompt(
-                                        "It seems we got disconnected or you are not available. "
-                                        "I will end the call now. Please call MedCenter Volta again anytime. Goodbye."
+                                        f"{_lang_instruction}"
+                                        "Tell the caller it seems we got disconnected or they are not available, "
+                                        "you will end the call now, and they can call MedCenter Volta again anytime. Say goodbye."
                                     )
                                     call_end_requested.set()
+                                    # Wait for goodbye audio to play before hanging up
+                                    await asyncio.sleep(5.0)
+                                    _hung = await _do_acs_hangup("inactivity")
+                                    if not _hung:
+                                        logger.error("[INACTIVITY] Hangup failed — call may remain connected")
                                     return
 
                                 if idle_for >= prompt_2_after and last_prompt_stage < 2:
                                     last_prompt_stage = 2
                                     await send_assistant_prompt(
-                                        "Are you still there? If you need help with an appointment or general information, "
-                                        "please tell me what you need."
+                                        f"{_lang_instruction}"
+                                        "Ask the caller if they are still there, and if they need help with an appointment or general information."
                                     )
                                     continue
 
                                 if idle_for >= prompt_1_after and last_prompt_stage < 1:
                                     last_prompt_stage = 1
                                     await send_assistant_prompt(
-                                        "Are you still there? How may I assist you today?"
+                                        f"{_lang_instruction}"
+                                        "Ask the caller if they are still there and how you may assist them today."
                                     )
                                     continue
 
                         except asyncio.CancelledError:
+                            logger.info("[INACTIVITY] Monitor cancelled (call likely ended externally)")
                             return
                         except Exception:
                             logger.exception("Inactivity monitor error")
                             return
+
                     async def from_client_to_server():
                         nonlocal session_id
                         try:
@@ -362,6 +424,7 @@ class RTMiddleTier:
                                     elif event_type == "response.function_call_arguments.done":
                                         _call_id = original_data.get("call_id")
                                         _func_name = original_data.get("name")
+                                        logger.info(f"[FUNCTION CALL] OpenAI invoked: {_func_name} (call_id={_call_id}, session={session_id})")
                                         try:
                                             _fn_args = json.loads(original_data.get("arguments", "{}"))
                                         except json.JSONDecodeError:
@@ -424,6 +487,13 @@ class RTMiddleTier:
                                                                 except Exception:
                                                                     pass
 
+                                                    # Store valid calendar IDs for this session so
+                                                    # get_available_slots can validate against them.
+                                                    _valid_calendar_ids.clear()
+                                                    for __d in __doctors:
+                                                        _valid_calendar_ids.add(__d["calendar_id"])
+                                                    logger.info(f"[DOCTORS] Valid calendar IDs for session: {_valid_calendar_ids}")
+
                                                     _result = json.dumps(__doctors)
                                                 except Exception as __e:
                                                     logger.error(f"Error in get_available_doctors: {__e}")
@@ -434,6 +504,32 @@ class RTMiddleTier:
                                                     __cal_id = _args.get("calendar_id")
                                                     __target_date_str = _args.get("date")
                                                     __tod = _args.get("time_of_day", "any")
+
+                                                    # --- ENFORCE: get_available_doctors must be called first ---
+                                                    if not _valid_calendar_ids:
+                                                        logger.warning(f"[SLOTS BLOCKED] get_available_slots called without prior get_available_doctors. calendar_id={__cal_id}, session={session_id}")
+                                                        _result = json.dumps({
+                                                            "error": "You must call get_available_doctors first before checking slots. "
+                                                            "Ask the caller which doctor they prefer, then call get_available_doctors to get the list, "
+                                                            "let the caller choose, and only then call get_available_slots with the correct calendar_id."
+                                                        })
+                                                        raise ValueError("blocked: doctors not fetched")
+
+                                                    try:
+                                                        __cal_id_int = int(__cal_id)
+                                                    except (TypeError, ValueError):
+                                                        __cal_id_int = None
+
+                                                    if __cal_id_int not in _valid_calendar_ids:
+                                                        logger.warning(f"[SLOTS BLOCKED] Invalid calendar_id={__cal_id}. Valid IDs: {_valid_calendar_ids}. session={session_id}")
+                                                        _result = json.dumps({
+                                                            "error": f"calendar_id {__cal_id} is not valid. "
+                                                            f"Valid calendar IDs from get_available_doctors are: {sorted(_valid_calendar_ids)}. "
+                                                            "Please use one of these IDs based on the doctor the caller selected."
+                                                        })
+                                                        raise ValueError("blocked: invalid calendar_id")
+                                                    # --- END ENFORCEMENT ---
+
                                                     __target_day = date.fromisoformat(__target_date_str)
                                                     __start_dt = datetime.combine(__target_day, datetime.min.time())
                                                     __end_dt = datetime.combine(__target_day, datetime.max.time()).replace(microsecond=0)
@@ -455,16 +551,55 @@ class RTMiddleTier:
 
                                                     __slot_iso = [__s.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S") for __s in __slots][:10]
                                                     _result = json.dumps({"available_slots": __slot_iso})
+                                                except ValueError:
+                                                    # Validation block (doctors not fetched / invalid ID)
+                                                    # _result was already set above, just pass through
+                                                    pass
                                                 except Exception as __e:
                                                     logger.error(f"Error in get_available_slots: {__e}")
                                                     _result = json.dumps({"error": str(__e)})
 
                                             elif _func_name == "book_appointment":
                                                 try:
+                                                    # --- ENFORCE: validate calendar_id before booking ---
+                                                    __book_cal_id = _args.get("calendar_id")
+                                                    try:
+                                                        __book_cal_id_int = int(__book_cal_id)
+                                                    except (TypeError, ValueError):
+                                                        __book_cal_id_int = None
+
+                                                    if not _valid_calendar_ids:
+                                                        logger.warning(f"[BOOKING BLOCKED] book_appointment called without prior get_available_doctors. calendar_id={__book_cal_id}, session={session_id}")
+                                                        _result = json.dumps({
+                                                            "error": "You must call get_available_doctors first to get valid doctor calendar IDs before booking. "
+                                                            "Ask the caller which doctor they prefer, call get_available_doctors, then proceed."
+                                                        })
+                                                        raise ValueError("blocked: doctors not fetched")
+
+                                                    if __book_cal_id_int not in _valid_calendar_ids:
+                                                        logger.warning(f"[BOOKING BLOCKED] Invalid calendar_id={__book_cal_id}. Valid IDs: {_valid_calendar_ids}. session={session_id}")
+                                                        _result = json.dumps({
+                                                            "error": f"calendar_id {__book_cal_id} is not valid. "
+                                                            f"Valid calendar IDs are: {sorted(_valid_calendar_ids)}. "
+                                                            "Use the correct ID for the doctor the caller chose."
+                                                        })
+                                                        raise ValueError("blocked: invalid calendar_id")
+                                                    # --- END ENFORCEMENT ---
+
                                                     __dob = _args.get("patient_dob", "")
                                                     if len(__dob) == 10:
                                                         __dob += "T00:00:00"
                                                     __phone = _args.get("patient_phone")
+                                                    # Ensure we always have the real caller phone number
+                                                    try:
+                                                        __caller_sess = session_manager.active_sessions.get(session_id)
+                                                        if __caller_sess and __caller_sess.participants:
+                                                            __acs_phone = __caller_sess.participants[0].get("phone_number")
+                                                            if __acs_phone:
+                                                                if not __phone or __phone in ("MISSING", "+41", "+41..."):
+                                                                    __phone = __acs_phone
+                                                    except Exception:
+                                                        pass
                                                     __visit_reason = _args.get("visit_reason", "")
                                                     __comment = _args.get("comment", "")
 
@@ -563,7 +698,7 @@ class RTMiddleTier:
                                                     __onedoc_key = _res.get("onedoc_key") or _res.get("onedocKey") or _res.get("key") if isinstance(_res, dict) else None
                                                     if __onedoc_key:
                                                         logger.info(f"[BOOKING SUCCESS] {_args.get('slot_iso')[:10]} ref:{__onedoc_key[:8]}...")
-                                                        _result = json.dumps({"status": "success", "booking_reference": __onedoc_key, "instruction": "DO NOT speak the booking_reference to the caller."})
+                                                        _result = json.dumps({"status": "success", "booking_reference": __onedoc_key, "instruction": "DO NOT speak the booking_reference to the caller. Confirm the appointment details briefly, then ask if there is anything else you can help with. Only call terminate_call after the caller confirms they have no further questions and you have said goodbye."})
 
                                                         # --- PHONEBOOK INTEGRATION (fire-and-forget) ---
                                                         # Capture values from outer scope into local names
@@ -668,29 +803,81 @@ class RTMiddleTier:
                                                                         logger.warning("[PHONEBOOK] Failed to add new patient")
                                                             except Exception as pe:
                                                                 logger.warning(f"[PHONEBOOK] Error during phonebook integration: {pe}")
-                                                        asyncio.create_task(_phonebook_update())
+                                                        _dynamic_tasks.append(asyncio.create_task(_phonebook_update()))
                                                         # --- END PHONEBOOK INTEGRATION ---
+
+                                                        # --- AUTO-HANGUP FALLBACK ---
+                                                        # If the AI fails to call terminate_call after booking,
+                                                        # auto-hangup after 60 seconds so the call doesn't hang.
+                                                        # Longer timeout since AI now asks "anything else?" before ending.
+                                                        async def _auto_hangup_fallback():
+                                                            await asyncio.sleep(60)
+                                                            if not call_end_requested.is_set():
+                                                                logger.warning(f"[AUTO-HANGUP] 60s passed after booking — terminate_call was NOT called. session={session_id}")
+                                                                call_end_requested.set()
+                                                                _hung = await _do_acs_hangup("auto_hangup_post_booking")
+                                                                if not _hung:
+                                                                    logger.error("[AUTO-HANGUP] Fallback hangup FAILED — call may remain connected")
+                                                            else:
+                                                                logger.debug("[AUTO-HANGUP] call_end_requested already set — skipping (terminate_call was called)")
+                                                        _dynamic_tasks.append(asyncio.create_task(_auto_hangup_fallback()))
+                                                        # --- END AUTO-HANGUP FALLBACK ---
 
                                                     else:
                                                         _result = json.dumps({"status": "success", "message": "Appointment booked but no reference generated."})
+                                                except ValueError:
+                                                    # Validation block (doctors not fetched / invalid ID)
+                                                    # _result was already set above, just pass through
+                                                    pass
                                                 except Exception as __e:
                                                     logger.error(f"Error in book_appointment: {__e}")
                                                     _result = json.dumps({"status": "error", "message": str(__e)})
 
                                             elif _func_name == "terminate_call":
-                                                logger.info("[CALL END] AI requested hangup")
+                                                logger.info(f"[CALL END] AI requested terminate_call — session={session_id}")
                                                 call_end_requested.set()
                                                 _result = json.dumps({"status": "success", "message": "Terminating call now."})
-                                                
+
+                                                # Log session state at the moment of terminate
+                                                _tc_sess = session_manager.active_sessions.get(session_id)
+                                                if _tc_sess:
+                                                    logger.info(
+                                                        f"[CALL END] Session state: call_connection_id={_tc_sess.call_connection_id}, "
+                                                        f"status={_tc_sess.status}, event_count={_tc_sess.event_count}, "
+                                                        f"server_call_id={_tc_sess.server_call_id}"
+                                                    )
+                                                else:
+                                                    logger.error(f"[CALL END] Session {session_id} NOT FOUND in active_sessions at terminate_call time!")
+
+                                                # Wait for the agent's goodbye audio to finish playing
+                                                logger.info("[CALL END] Waiting 4s for goodbye audio to finish...")
+                                                await asyncio.sleep(4.0)
+
                                                 # Actually hang up the ACS call
-                                                try:
-                                                    _session = session_manager.active_sessions.get(session_id)
-                                                    if _session and _session.call_connection_id:
-                                                        from utils.acs import acs_caller
-                                                        await acs_caller.hang_up(_session.call_connection_id)
-                                                        logger.info("[CALL END] ACS hangup sent")
-                                                except Exception as _hangup_err:
-                                                    logger.error(f"[CALL END] Hangup failed: {_hangup_err}")
+                                                _hung = await _do_acs_hangup("terminate_call")
+                                                if not _hung:
+                                                    logger.error("[CALL END] terminate_call hangup FAILED — call may remain connected")
+
+                                            elif _func_name == "store_insurance_card_number":
+                                                __card = _args.get("card_number", "").strip()
+                                                # Remove any spaces/dashes for validation
+                                                __card_digits = re.sub(r'[\s\-]', '', __card)
+                                                if __card_digits and session_id:
+                                                    # Validate: must start with 807 and be exactly 20 digits
+                                                    if not __card_digits.startswith("807"):
+                                                        _result = json.dumps({"status": "error", "message": "Invalid card number — it must start with 807. Please ask the caller to check the number on the front of their card and try again."})
+                                                    elif len(__card_digits) != 20:
+                                                        _result = json.dumps({"status": "error", "message": f"Invalid card number — it must be exactly 20 digits. The number provided has {len(__card_digits)} digits. Please ask the caller to re-read the complete number."})
+                                                    elif not __card_digits.isdigit():
+                                                        _result = json.dumps({"status": "error", "message": "Invalid card number — it must contain only digits. Please ask the caller to re-read the number."})
+                                                    else:
+                                                        __sess = session_manager.active_sessions.get(session_id)
+                                                        if __sess:
+                                                            __sess.insurance_card_number = __card_digits
+                                                            logger.info(f"[INSURANCE] Stored card number for session {session_id[:8]}")
+                                                        _result = json.dumps({"status": "success", "message": "Insurance card number stored for documentation."})
+                                                else:
+                                                    _result = json.dumps({"status": "error", "message": "No card number provided or no active session."})
 
                                             elif _func_name == "search_knowledge_base":
                                                 try:
@@ -719,9 +906,11 @@ class RTMiddleTier:
                                                         logger.debug(f"[TOOL] Cancelled holding response before submitting {_func_name} result")
                                                     except Exception:
                                                         pass
-                                                        await wait_for_response_idle(timeout=1.5)
+                                                # Always wait for response to finish before submitting tool output
+                                                await wait_for_response_idle(timeout=2.0)
 
                                             # Submit function output back to OpenAI
+                                            logger.info(f"[FUNCTION RESULT] Sending output for {_func_name} (call_id={_call_id}): {_result[:120]}")
                                             await target_ws.send_str(json.dumps({
                                                 "type": "conversation.item.create",
                                                 "item": {
@@ -735,11 +924,14 @@ class RTMiddleTier:
                                             if not call_end_requested.is_set():
                                                 # Ensure any previous response (like 'One moment please') is dead
                                                 await wait_for_response_idle(timeout=1.5)
+                                                logger.debug(f"[FUNCTION RESULT] Sending response.create after {_func_name}")
                                                 await target_ws.send_str(json.dumps({
                                                     "type": "response.create"
                                                 }))
+                                            else:
+                                                logger.info(f"[FUNCTION RESULT] Skipping response.create — call_end_requested is set (func={_func_name})")
 
-                                        asyncio.create_task(_run_function_call(_call_id, _func_name, _fn_args))
+                                        _dynamic_tasks.append(asyncio.create_task(_run_function_call(_call_id, _func_name, _fn_args)))
 
                                     if event_type == "input_audio_buffer.speech_started":
                                         # If the call is ending, ignore any new speech events
@@ -787,7 +979,7 @@ class RTMiddleTier:
                                                     cancel_sent_for_current_turn = False
                                                     unsuppress_scheduled = False
                                                     logger.debug("[TURN] AI can respond")
-                                            asyncio.create_task(_unsuppress_after_delay())
+                                            _dynamic_tasks.append(asyncio.create_task(_unsuppress_after_delay()))
                                         # --- END TURN DETECTION ---
 
                                     if suppress_agent_audio and event_type == "response.audio.delta":
@@ -814,21 +1006,17 @@ class RTMiddleTier:
                                                 except Exception as e:
                                                     logger.error(f"[TRANSCRIPT ERROR] {e}")
 
-                                            if transcription_data.get("speaker") == "customer":
-                                                utterance = transcription_data.get("utterance_text", "").strip()
-                                                # Skip very short / noise transcriptions
-                                                if len(utterance) <= 2:
-                                                    logger.debug(f"[NOISE] Skipped: '{utterance}'")
-                                                else:
-                                                    # Run language detection (CPU bound) in a thread to avoid blocking main loop
-                                                    if detect_lang and len(utterance) > 12:  # only detect on reasonable length
-                                                        try:
-                                                            _lang = await asyncio.to_thread(detect_lang, utterance)
-                                                            if _lang and _lang != detected_conversation_language:
-                                                                detected_conversation_language = _lang
-                                                                logger.debug(f"[LANG] Detected change to: {_lang}")
-                                                        except Exception:
-                                                            pass
+                                            # Detect language from AGENT responses (more reliable than garbled customer STT)
+                                            if transcription_data.get("speaker") == "agent":
+                                                agent_text = transcription_data.get("utterance_text", "").strip()
+                                                if detect_lang and len(agent_text) > 20:
+                                                    try:
+                                                        _lang = await asyncio.to_thread(detect_lang, agent_text)
+                                                        if _lang and _lang != detected_conversation_language:
+                                                            detected_conversation_language = _lang
+                                                            logger.debug(f"[LANG] Detected from agent response: {_lang}")
+                                                    except Exception:
+                                                        pass
                                     except Exception as e:
                                         logger.debug(f"Transcription processing error: {e}")
                                     
@@ -882,7 +1070,22 @@ class RTMiddleTier:
                                 await task
                             except asyncio.CancelledError:
                                 pass
-                                
+
+                        # Cancel dynamically-created tasks (function calls, phonebook updates, turn detection)
+                        for task in _dynamic_tasks:
+                            if not task.done():
+                                task.cancel()
+                                try:
+                                    await task
+                                except (asyncio.CancelledError, Exception):
+                                    pass
+
+                        # Ensure the ACS call is hung up so CallDisconnected event fires
+                        logger.info(f"[CLEANUP] Forward loop ended — ensuring ACS call is hung up. session={session_id}, call_end_requested={call_end_requested.is_set()}")
+                        _hung = await _do_acs_hangup("forward_loop_cleanup")
+                        if not _hung:
+                            logger.warning("[CLEANUP] Cleanup hangup returned False — call may already be disconnected or session missing")
+
                     except asyncio.CancelledError:
                         logger.debug("Forward messages cancelled")
                         raise

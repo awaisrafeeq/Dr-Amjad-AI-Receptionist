@@ -127,19 +127,28 @@ class EmailService:
             
             # Build email subject
             caller_phone = caller_info.get("phone", "Unknown") if caller_info else "Unknown"
+            insurance_card_number = caller_info.get("insurance_card_number") if caller_info else None
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
             subject = f"Call Transcript - {caller_phone} - {timestamp}"
-            
+
+            # Build insurance card HTML/text snippets (only for new patients)
+            insurance_html = ""
+            insurance_text = ""
+            if insurance_card_number:
+                insurance_html = f"<strong>Health Insurance Card No.:</strong> {insurance_card_number}<br>"
+                insurance_text = f"Health Insurance Card No.: {insurance_card_number}"
+
             # Build email body
             html_body = f"""
             <html>
             <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
                 <h2 style="color: #2c5aa0;">MedCenter Volta - Call Transcript</h2>
-                
+
                 <div style="background-color: #f4f4f4; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
                     <strong>Session ID:</strong> {session_id}<br>
                     <strong>Caller:</strong> {caller_phone}<br>
                     <strong>Date:</strong> {timestamp}<br>
+                    {insurance_html}
                 </div>
                 
                 <h3 style="color: #2c5aa0;">Conversation Transcript:</h3>
@@ -161,6 +170,7 @@ class EmailService:
 Session ID: {session_id}
 Caller: {caller_phone}
 Date: {timestamp}
+{insurance_text}
 
 --- Conversation Transcript ---
 

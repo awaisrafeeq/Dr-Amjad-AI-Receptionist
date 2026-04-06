@@ -34,12 +34,12 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                 "output_audio_format": "pcm16",
                 "turn_detection": {
                     "type": 'server_vad',
-                    "threshold": 0.75,
-                    "prefix_padding_ms": 200,
-                    "silence_duration_ms": 600
+                    "threshold": 0.8,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 800
                 },
                 "input_audio_transcription": {
-                  "model": "whisper-1", 
+                  "model": "whisper-1",
                 },
                 "input_audio_noise_reduction": {
                     "type": "near_field"  
@@ -104,6 +104,21 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                         "parameters": {
                             "type": "object",
                             "properties": {}
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "store_insurance_card_number",
+                        "description": "Store the caller's Swiss health insurance card number for internal documentation. Call this ONLY for NEW/unmatched patients after they provide their card number. The number MUST start with 807 and be exactly 20 digits. If validation fails, ask the caller to re-read the number.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "card_number": {
+                                    "type": "string",
+                                    "description": "The 20-digit health insurance card number starting with 807. Must be exactly 20 digits, digits only."
+                                }
+                            },
+                            "required": ["card_number"]
                         }
                     },
                     {

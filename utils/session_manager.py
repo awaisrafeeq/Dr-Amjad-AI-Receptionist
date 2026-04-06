@@ -33,6 +33,7 @@ class CallSession:
     transcription_count: int = 0
     event_count: int = 0
     phonebook_match: Optional[Dict[str, Any]] = None
+    insurance_card_number: Optional[str] = None
 
 class SessionManager:
     """Manages call sessions and coordinates logging activities."""
@@ -40,6 +41,7 @@ class SessionManager:
     def __init__(self):
         self.active_sessions: Dict[str, CallSession] = {}
         self._session_lock = asyncio.Lock()
+        self._cleanup_in_progress: set = set()  # guards against concurrent cleanup from WS + CallDisconnected
         # self.session_call_mapping: Dict[str, str] = {}  # call_connection_id -> session_id
         
     async def create_session(self, event: Dict[Any, Any], event_type: str) -> str:
@@ -226,12 +228,14 @@ class SessionManager:
             # Remove from active sessions
             async with self._session_lock:
                 self.active_sessions.pop(session_id, None)
-            
+            self._cleanup_in_progress.discard(session_id)
+
             logger.info(f"[SESSION] Ended: {session_id}")
             return True
-            
+
         except Exception as e:
             logger.error(f"[SESSION] End error: {e}")
+            self._cleanup_in_progress.discard(session_id)
             return False
             
     async def log_event(self, session_id: Optional[str] = None, event_data: Optional[Dict[str, Any]] = None):
@@ -387,6 +391,13 @@ class SessionManager:
                 return False
             
             caller_info = {"phone": caller_phone} if caller_phone else None
+
+            # Attach insurance card number if collected during the call
+            session = self.active_sessions.get(session_id)
+            if session and session.insurance_card_number:
+                if caller_info is None:
+                    caller_info = {}
+                caller_info["insurance_card_number"] = session.insurance_card_number
             
             # --- DOCTOR-SPECIFIC EMAIL ROUTING ---
             # Determine if this should go to a specific doctor
