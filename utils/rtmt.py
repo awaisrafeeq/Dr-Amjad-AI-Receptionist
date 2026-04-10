@@ -55,11 +55,36 @@ class RTMiddleTier:
         self.key = config["azure_openai_key"]
 
         self.selected_voice = "shimmer"
-        self.system_message = load_prompt_from_markdown("system_prompt.md")
+        self._prompt_path = "system_prompt.md"
+        self._prompt_mtime: float = 0.0
+        self.system_message = self._load_prompt()
         self._doctor_cache: Dict[int, str] = {}  # calendar_id -> doctor_name, avoids extra GET /calendars after booking
+
+    def _load_prompt(self) -> Optional[str]:
+        """Load system prompt from file and track its modification time."""
+        try:
+            mtime = os.path.getmtime(self._prompt_path)
+            self._prompt_mtime = mtime
+            return load_prompt_from_markdown(self._prompt_path)
+        except Exception as e:
+            logger.error(f"[PROMPT] Failed to load {self._prompt_path}: {e}")
+            return self.system_message  # keep existing if reload fails
+
+    def _refresh_prompt_if_changed(self) -> None:
+        """Reload system prompt only if the file has been modified since last load."""
+        try:
+            mtime = os.path.getmtime(self._prompt_path)
+            if mtime > self._prompt_mtime:
+                new_prompt = load_prompt_from_markdown(self._prompt_path)
+                self.system_message = new_prompt
+                self._prompt_mtime = mtime
+                logger.info("[PROMPT] Reloaded (file changed)")
+        except Exception:
+            pass  # keep existing prompt on any error
 
     
     async def forward_messages(self, ws: WebSocket, is_acs_audio_stream: bool, session_id: Optional[str] = None):
+        self._refresh_prompt_if_changed()
         async with aiohttp.ClientSession(base_url=self.endpoint) as session:
             headers = {
                 "api-key": self.key,
@@ -87,6 +112,7 @@ class RTMiddleTier:
                     suppress_agent_audio = False
                     cancel_sent_for_current_turn = False
                     response_active = False
+                    hangup_sent = False  # Guard against double hangup
                     _dynamic_tasks: list = []  # tracks fire-and-forget tasks for cleanup
 
                     # Per-session doctor validation: get_available_slots is blocked
@@ -137,7 +163,11 @@ class RTMiddleTier:
                     async def _do_acs_hangup(reason: str) -> bool:
                         """Centralized ACS hangup with full diagnostic logging.
                         Returns True if hangup was sent, False otherwise."""
+                        nonlocal hangup_sent
                         _tag = f"[HANGUP:{reason}]"
+                        if hangup_sent:
+                            logger.info(f"{_tag} Skipping — hangup already sent for session={session_id[:8] if session_id else '?'}")
+                            return True
                         logger.info(f"{_tag} Attempting ACS hangup for session={session_id}")
 
                         if not session_id:
@@ -162,6 +192,7 @@ class RTMiddleTier:
                             from utils.acs import acs_caller as _acs_ref
                             logger.info(f"{_tag} Sending hang_up for call_connection_id={_conn_id[:12]}...")
                             await _acs_ref.hang_up(_conn_id)
+                            hangup_sent = True
                             logger.info(f"{_tag} SUCCESS — ACS hangup sent for session={session_id[:8]}")
                             return True
                         except Exception as _hup_err:
@@ -230,6 +261,7 @@ class RTMiddleTier:
                                         })
                                     )
                                     logger.info(f"[PHONEBOOK] Injected match for {_pb_match.get('first_name')} {_pb_match.get('last_name')} into OpenAI session")
+                                    logger.info(f"[PHONEBOOK DEBUG] birth_date={_pb_match.get('birth_date')}, email={_pb_match.get('email')}, address={_pb_match.get('address')}, zip={_pb_match.get('zip_code')}, city={_pb_match.get('city')}, phone={_pb_match.get('phone')}")
                         except Exception as _pb_err:
                             logger.warning(f"[PHONEBOOK] Failed to inject context into session: {_pb_err}")
                         # --- END PHONEBOOK INJECTION ---
@@ -268,9 +300,9 @@ class RTMiddleTier:
                             return
 
                         # Silence policy (seconds)
-                        prompt_1_after = 90  # Increased from 60s
-                        prompt_2_after = 180 # Increased from 120s
-                        hangup_after = 360   # Increased from 300s
+                        prompt_1_after = 45   # First "are you there?" prompt
+                        prompt_2_after = 90   # Second prompt
+                        hangup_after = 180    # Auto-hangup (3 minutes total)
 
                         try:
                             while not call_end_requested.is_set():
@@ -385,7 +417,7 @@ class RTMiddleTier:
                             
                     # --- TURN DETECTION CONFIGURATION ---
                     # Delay after speech stops before AI can respond (seconds)
-                    TURN_DETECTION_DELAY = 0.0  # OpenAI server_vad silence_duration_ms=600 already handles turn timing
+                    TURN_DETECTION_DELAY = 0.3  # Wait 0.3s after speech stops to filter phantom transcriptions
                     speech_stop_time = 0.0
                     unsuppress_scheduled = False  # Flag to prevent duplicate scheduling
                     # --- END TURN DETECTION CONFIG ---
@@ -397,8 +429,6 @@ class RTMiddleTier:
                             async for msg in target_ws:
                                 if msg.type == aiohttp.WSMsgType.TEXT:
                                     original_data = json.loads(msg.data)
-                                    event_type = original_data.get("type")
-                                    # Log only essential conversation events (not every message)
                                     event_type = original_data.get("type")
                                     
                                     # Log error details — suppress known harmless errors as DEBUG
@@ -585,6 +615,46 @@ class RTMiddleTier:
                                                         })
                                                         raise ValueError("blocked: invalid calendar_id")
                                                     # --- END ENFORCEMENT ---
+
+                                                    # --- AUTO-FILL FROM PHONEBOOK ---
+                                                    # If OpenAI didn't provide data (marked MISSING or empty), use phonebook
+                                                    try:
+                                                        __caller_session = session_manager.active_sessions.get(session_id)
+                                                        __caller_phone = __caller_session.participants[0]["phone_number"] if __caller_session and __caller_session.participants else None
+                                                        if __caller_phone:
+                                                            from utils.phonebook_lookup import get_phonebook_lookup
+                                                            __pb_lookup = get_phonebook_lookup()
+                                                            if __pb_lookup:
+                                                                __pb_match = __pb_lookup.lookup_by_phone(__caller_phone)
+                                                                if __pb_match:
+                                                                    # Auto-fill DOB
+                                                                    if not _args.get("patient_dob") or _args.get("patient_dob") in ("MISSING", ""):
+                                                                        if __pb_match.birth_date and __pb_match.birth_date not in ("MISSING", ""):
+                                                                            _args["patient_dob"] = __pb_match.birth_date
+                                                                            logger.info(f"[BOOKING AUTO-FILL] DOB from phonebook: {__pb_match.birth_date}")
+                                                                    # Auto-fill street/address
+                                                                    if not _args.get("street") or _args.get("street") in ("MISSING", ""):
+                                                                        if __pb_match.address and __pb_match.address not in ("MISSING", ""):
+                                                                            _args["street"] = __pb_match.address
+                                                                            logger.info(f"[BOOKING AUTO-FILL] Address from phonebook: {__pb_match.address}")
+                                                                    # Auto-fill zip_code
+                                                                    if not _args.get("zip_code") or _args.get("zip_code") in ("MISSING", ""):
+                                                                        if __pb_match.zip_code and __pb_match.zip_code not in ("MISSING", ""):
+                                                                            _args["zip_code"] = __pb_match.zip_code
+                                                                            logger.info(f"[BOOKING AUTO-FILL] Zip from phonebook: {__pb_match.zip_code}")
+                                                                    # Auto-fill city
+                                                                    if not _args.get("city") or _args.get("city") in ("MISSING", ""):
+                                                                        if __pb_match.city and __pb_match.city not in ("MISSING", ""):
+                                                                            _args["city"] = __pb_match.city
+                                                                            logger.info(f"[BOOKING AUTO-FILL] City from phonebook: {__pb_match.city}")
+                                                                    # Auto-fill email
+                                                                    if not _args.get("patient_email") or _args.get("patient_email") in ("MISSING", ""):
+                                                                        if __pb_match.email and __pb_match.email not in ("MISSING", ""):
+                                                                            _args["patient_email"] = __pb_match.email
+                                                                            logger.info(f"[BOOKING AUTO-FILL] Email from phonebook: {__pb_match.email}")
+                                                    except Exception as __auto_err:
+                                                        logger.warning(f"[BOOKING AUTO-FILL] Failed to auto-fill from phonebook: {__auto_err}")
+                                                    # --- END AUTO-FILL ---
 
                                                     __dob = _args.get("patient_dob", "")
                                                     if len(__dob) == 10:
@@ -1006,15 +1076,26 @@ class RTMiddleTier:
                                                 except Exception as e:
                                                     logger.error(f"[TRANSCRIPT ERROR] {e}")
 
-                                            # Detect language from AGENT responses (more reliable than garbled customer STT)
-                                            if transcription_data.get("speaker") == "agent":
-                                                agent_text = transcription_data.get("utterance_text", "").strip()
-                                                if detect_lang and len(agent_text) > 20:
+                                            # Detect language from BOTH agent and customer responses
+                                            if transcription_data.get("speaker") in ("agent", "customer"):
+                                                text = transcription_data.get("utterance_text", "").strip().lower()
+                                                # Check for explicit language switch phrases first
+                                                if any(phrase in text for phrase in ["speak english", "in english", "switch to english", "we can speak english"]):
+                                                    if detected_conversation_language != "en":
+                                                        detected_conversation_language = "en"
+                                                        logger.info(f"[LANG] Explicit switch to English detected from {transcription_data.get('speaker')}")
+                                                # Also detect from German phrases
+                                                elif any(phrase in text for phrase in ["deutsch", "auf deutsch", "auf deutsch sprechen"]):
+                                                    if detected_conversation_language != "de":
+                                                        detected_conversation_language = "de"
+                                                        logger.info(f"[LANG] Explicit switch to German detected from {transcription_data.get('speaker')}")
+                                                # Fall back to langdetect for longer utterances
+                                                elif detect_lang and len(text) > 15:
                                                     try:
-                                                        _lang = await asyncio.to_thread(detect_lang, agent_text)
-                                                        if _lang and _lang != detected_conversation_language:
+                                                        _lang = await asyncio.to_thread(detect_lang, text)
+                                                        if _lang and _lang in ("en", "de") and _lang != detected_conversation_language:
                                                             detected_conversation_language = _lang
-                                                            logger.debug(f"[LANG] Detected from agent response: {_lang}")
+                                                            logger.debug(f"[LANG] Detected from {transcription_data.get('speaker')}: {_lang}")
                                                     except Exception:
                                                         pass
                                     except Exception as e:

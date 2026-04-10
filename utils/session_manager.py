@@ -174,6 +174,7 @@ class SessionManager:
             async with self._session_lock:
                 if not session_id or session_id not in self.active_sessions:
                     logger.warning(f"[SESSION] Not found: {session_id}")
+                    self._cleanup_in_progress.discard(session_id)
                     return False
                 session = self.active_sessions[session_id]
             

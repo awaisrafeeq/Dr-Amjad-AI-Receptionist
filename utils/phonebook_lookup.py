@@ -88,7 +88,13 @@ def _cell_to_str(value: Any) -> Optional[str]:
         return None
 
 
-def _download_phonebook_from_blob_to_cache() -> Optional[str]:
+import time as _time
+
+_last_blob_refresh: float = 0.0
+_BLOB_REFRESH_INTERVAL = float(os.getenv("PHONEBOOK_BLOB_REFRESH_SECONDS", "1800"))  # default 30 minutes
+
+
+def _download_phonebook_from_blob_to_cache(force_download: bool = False) -> Optional[str]:
     blob_url = (os.getenv("PHONEBOOK_BLOB_URL") or "").strip()
     container = (os.getenv("PHONEBOOK_BLOB_CONTAINER") or "").strip()
     blob_name = (os.getenv("PHONEBOOK_BLOB_NAME") or "").strip()
@@ -100,7 +106,7 @@ def _download_phonebook_from_blob_to_cache() -> Optional[str]:
     if not blob_url and not (container and blob_name):
         return None
 
-    force = (os.getenv("PHONEBOOK_BLOB_FORCE_REFRESH") or "").strip().lower() in {"1", "true", "yes"}
+    force = force_download or (os.getenv("PHONEBOOK_BLOB_FORCE_REFRESH") or "").strip().lower() in {"1", "true", "yes"}
 
     cache_key = blob_url or f"{container}/{blob_name}"
     cache_hash = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:16]
@@ -518,23 +524,40 @@ _phonebook_singleton: Optional[PhonebookLookup] = None
 def get_phonebook_lookup() -> Optional[PhonebookLookup]:
     """Create a singleton phonebook lookup instance if enabled via env vars.
 
+    Periodically re-downloads the phonebook from blob storage (default every 30 min)
+    so that external edits are picked up without requiring a restart.
+
     Env:
       - ENABLE_INTERNAL_PHONEBOOK_LOOKUP=true
       - PHONEBOOK_XLSX_PATH=/path/to/xlsx
+      - PHONEBOOK_BLOB_REFRESH_SECONDS=1800
     """
-    global _phonebook_singleton
+    global _phonebook_singleton, _last_blob_refresh
 
     enabled = (os.getenv("ENABLE_INTERNAL_PHONEBOOK_LOOKUP") or "").strip().lower() in {"1", "true", "yes"}
     if not enabled:
         return None
 
     path = (os.getenv("PHONEBOOK_XLSX_PATH") or "").strip()
+
+    # Check if it's time to refresh from blob
+    now = _time.time()
+    needs_blob_refresh = (not path) and (now - _last_blob_refresh >= _BLOB_REFRESH_INTERVAL)
+
     if not path:
-        path = _download_phonebook_from_blob_to_cache() or ""
+        path = _download_phonebook_from_blob_to_cache(force_download=needs_blob_refresh) or ""
+        if needs_blob_refresh and path:
+            _last_blob_refresh = now
     if not path:
         return None
 
     if _phonebook_singleton is None or _phonebook_singleton.xlsx_path != path:
         _phonebook_singleton = PhonebookLookup(path)
+    elif needs_blob_refresh:
+        # Same path but blob was re-downloaded — force reload of index
+        _phonebook_singleton._loaded = False
+        _phonebook_singleton._index.clear()
+        _phonebook_singleton.load()
+        logger.info("[PHONEBOOK] Refreshed from blob storage")
 
     return _phonebook_singleton

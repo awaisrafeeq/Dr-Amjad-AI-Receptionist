@@ -34,15 +34,15 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                 "output_audio_format": "pcm16",
                 "turn_detection": {
                     "type": 'server_vad',
-                    "threshold": 0.8,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 800
+                    "threshold": 0.9,
+                    "prefix_padding_ms": 200,
+                    "silence_duration_ms": 1200
                 },
                 "input_audio_transcription": {
-                  "model": "whisper-1",
+                  "model": "gpt-4o-transcribe",
                 },
                 "input_audio_noise_reduction": {
-                    "type": "near_field"  
+                    "type": "far_field"
                 },
                 "tools": [
                     {

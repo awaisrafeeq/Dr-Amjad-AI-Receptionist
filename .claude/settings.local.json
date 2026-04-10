@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(grep -E \"^d|\\\\.py$|\\\\.txt$|\\\\.md$\")",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(grep:*)"
     ]
   }
 }

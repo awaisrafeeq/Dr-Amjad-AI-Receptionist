@@ -77,7 +77,39 @@ class EpaadClient:
                 return
             await self._authenticate(session)
 
+    _RETRYABLE_STATUS = {500, 502, 503, 504}
+
     async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(2):  # 1 original + 1 retry
+            try:
+                return await self._do_request(method, path, params=params, json_body=json_body)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_exc = e
+                if attempt == 0:
+                    logger.warning(f"[EPAAD API] Transient error on {method} {path}: {e} — retrying in 1s")
+                    await asyncio.sleep(1)
+            except RuntimeError as e:
+                # Retry only on server errors (5xx), not client errors (4xx)
+                if any(f"status={s}" in str(e) for s in self._RETRYABLE_STATUS):
+                    last_exc = e
+                    if attempt == 0:
+                        logger.warning(f"[EPAAD API] Server error on {method} {path}: {e} — retrying in 1s")
+                        await asyncio.sleep(1)
+                else:
+                    raise
+
+        raise last_exc  # type: ignore[misc]
+
+    async def _do_request(
         self,
         method: str,
         path: str,
@@ -88,8 +120,7 @@ class EpaadClient:
         async with aiohttp.ClientSession() as session:
             await self._ensure_token(session)
             url = f"{self._config.base_url}{path}"
-            
-            # DEBUG: Log request details
+
             logger.info(f"[EPAAD API REQUEST] {method} {url}")
             logger.info(f"[EPAAD API REQUEST] params={params}, body={json.dumps(json_body) if json_body else None}")
 

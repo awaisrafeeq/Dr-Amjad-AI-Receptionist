@@ -30,7 +30,7 @@ venv/
 .env.*
 
 # Data & Documents
-*.xlsx
+# *.xlsx
 *.xls
 *.pdf
 *.doc

@@ -5,6 +5,7 @@ Uses Azure Communication Services Email or SendGrid for email delivery.
 
 import os
 import logging
+import asyncio
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import aiohttp
@@ -299,8 +300,8 @@ Please review for accuracy and follow up as needed.
             }
             
             poller = client.begin_send(message)
-            result = poller.result()
-            
+            result = await asyncio.to_thread(poller.result)
+
             logger.info(f"Email sent successfully via ACS to {recipient}")
             return True
             

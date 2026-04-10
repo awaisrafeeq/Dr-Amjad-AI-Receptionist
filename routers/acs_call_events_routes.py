@@ -24,6 +24,11 @@ caller = acs_caller
 # --- Setup OpenAI Realtime bridge ---
 rtmt = rtmt
 
+# --- Dedup: track recently answered incoming calls to prevent duplicate sessions ---
+import time
+_recent_incoming_calls: dict[str, float] = {}  # correlation_id -> timestamp
+_DEDUP_WINDOW_SECONDS = 5.0
+
 # session_id = None  # REMOVED GLOBAL SESSION ID
 
 @router.post("/acs/incoming", tags=['ACS Call Events'])
@@ -56,7 +61,20 @@ async def inbound_call(request: Request):
                 else:
                     caller_id = event.data["from"]["rawId"]
                 logger.info(f"[CALL] Incoming from: {caller_id}")
-                
+
+                # Dedup: skip if we already answered this exact incoming call event recently
+                _correlation_id = event.data.get("correlationId", "")
+                _server_call_id = event.data.get("serverCallId", "")
+                _dedup_key = _correlation_id or _server_call_id or ""
+                if _dedup_key:
+                    _now = time.time()
+                    # Clean old entries
+                    _recent_incoming_calls.update({k: v for k, v in _recent_incoming_calls.items() if _now - v < _DEDUP_WINDOW_SECONDS})
+                    if _dedup_key in _recent_incoming_calls:
+                        logger.warning(f"[CALL] Duplicate incoming call detected (dedup_key={_dedup_key[:16]}...) — skipping")
+                        return Response(status_code=200)
+                    _recent_incoming_calls[_dedup_key] = _now
+
                 # create a new session ID for this call
                 try:
                     event_payload = event.data
