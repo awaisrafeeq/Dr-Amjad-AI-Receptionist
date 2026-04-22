@@ -92,6 +92,8 @@ import time as _time
 
 _last_blob_refresh: float = 0.0
 _BLOB_REFRESH_INTERVAL = float(os.getenv("PHONEBOOK_BLOB_REFRESH_SECONDS", "1800"))  # default 30 minutes
+_phonebook_refresh_lock = threading.Lock()
+_phonebook_refresh_thread: Optional[threading.Thread] = None
 
 
 def _download_phonebook_from_blob_to_cache(force_download: bool = False) -> Optional[str]:
@@ -160,6 +162,7 @@ class PhonebookLookup:
         self.xlsx_path = xlsx_path
         self._index: Dict[str, List[PhonebookMatch]] = {}
         self._loaded = False
+        self._entry_count = 0
         self._write_lock = threading.RLock()
 
     def load(self) -> None:
@@ -169,56 +172,64 @@ class PhonebookLookup:
 
             from openpyxl import load_workbook  # local import to avoid import cost if unused
 
-            wb = load_workbook(self.xlsx_path, data_only=True)
-            ws = wb[wb.sheetnames[0]]
-            rows = list(ws.iter_rows(values_only=True))
+            self._index.clear()
+            self._entry_count = 0
 
-            header_idx = _find_header_row(rows)
-            if header_idx is None:
-                # If schema changes, we fail closed (no lookup) rather than guessing.
+            wb = load_workbook(self.xlsx_path, data_only=True, read_only=True)
+            try:
+                ws = wb[wb.sheetnames[0]]
+                rows = list(ws.iter_rows(values_only=True))
+
+                header_idx = _find_header_row(rows)
+                if header_idx is None:
+                    # If schema changes, we fail closed (no lookup) rather than guessing.
+                    self._loaded = True
+                    return
+
+                header = [(_cell_to_str(c) or "") for c in rows[header_idx]]
+                col = {name: i for i, name in enumerate(header) if name}
+
+                def get(row: Tuple[Any, ...], name: str) -> Optional[str]:
+                    i = col.get(name)
+                    if i is None or i >= len(row):
+                        return None
+                    return _cell_to_str(row[i])
+
+                for r in rows[header_idx + 1 :]:
+                    patient_no = get(r, "Patienten-Nr.")
+                    last = get(r, "Nachname")
+                    first = get(r, "Vorname")
+                    if not (patient_no or last or first):
+                        continue
+
+                    match = PhonebookMatch(
+                        patient_number=patient_no,
+                        last_name=last,
+                        first_name=first,
+                        gender=get(r, "Geschlecht"),
+                        birth_date=get(r, "Geburtsdatum"),
+                        language=get(r, "Sprache"),
+                        phone=get(r, "Telefon"),
+                        mobile=get(r, "Mobile-Nr."),
+                        email=get(r, "Email"),
+                        doctor=get(r, "Arzt"),
+                        note=get(r, "Notiz"),
+                        address=get(r, "Adresse"),
+                        zip_code=get(r, "PLZ"),
+                        city=get(r, "Ort"),
+                    )
+
+                    self._entry_count += 1
+
+                    for raw in [match.phone, match.mobile]:
+                        for v in normalize_phone_variants(raw):
+                            if v not in self._index:
+                                self._index[v] = []
+                            self._index[v].append(match)
+
                 self._loaded = True
-                return
-
-            header = [(_cell_to_str(c) or "") for c in rows[header_idx]]
-            col = {name: i for i, name in enumerate(header) if name}
-
-            def get(row: Tuple[Any, ...], name: str) -> Optional[str]:
-                i = col.get(name)
-                if i is None or i >= len(row):
-                    return None
-                return _cell_to_str(row[i])
-
-            for r in rows[header_idx + 1 :]:
-                patient_no = get(r, "Patienten-Nr.")
-                last = get(r, "Nachname")
-                first = get(r, "Vorname")
-                if not (patient_no or last or first):
-                    continue
-
-                match = PhonebookMatch(
-                    patient_number=patient_no,
-                    last_name=last,
-                    first_name=first,
-                    gender=get(r, "Geschlecht"),
-                    birth_date=get(r, "Geburtsdatum"),
-                    language=get(r, "Sprache"),
-                    phone=get(r, "Telefon"),
-                    mobile=get(r, "Mobile-Nr."),
-                    email=get(r, "Email"),
-                    doctor=get(r, "Arzt"),
-                    note=get(r, "Notiz"),
-                    address=get(r, "Adresse"),
-                    zip_code=get(r, "PLZ"),
-                    city=get(r, "Ort"),
-                )
-
-                for raw in [match.phone, match.mobile]:
-                    for v in normalize_phone_variants(raw):
-                        if v not in self._index:
-                            self._index[v] = []
-                        self._index[v].append(match)
-
-            self._loaded = True
+            finally:
+                wb.close()
 
     def add_patient(self, patient_data: Dict[str, Any]) -> bool:
         """
@@ -521,6 +532,43 @@ def save_phonebook_to_blob(xlsx_path: str) -> bool:
 _phonebook_singleton: Optional[PhonebookLookup] = None
 
 
+def _refresh_phonebook_in_background() -> None:
+    global _phonebook_singleton, _last_blob_refresh, _phonebook_refresh_thread
+
+    try:
+        path = _download_phonebook_from_blob_to_cache(force_download=True) or ""
+        if not path:
+            return
+
+        _last_blob_refresh = _time.time()
+
+        if _phonebook_singleton is None or _phonebook_singleton.xlsx_path != path:
+            _phonebook_singleton = PhonebookLookup(path)
+
+        _phonebook_singleton._loaded = False
+        _phonebook_singleton._index.clear()
+        _phonebook_singleton.load()
+        logger.info("[PHONEBOOK] Refreshed from blob storage")
+    except Exception as exc:
+        logger.warning(f"[PHONEBOOK] Background refresh failed: {exc}")
+    finally:
+        with _phonebook_refresh_lock:
+            _phonebook_refresh_thread = None
+
+
+def _start_background_phonebook_refresh() -> None:
+    global _phonebook_refresh_thread
+    with _phonebook_refresh_lock:
+        if _phonebook_refresh_thread and _phonebook_refresh_thread.is_alive():
+            return
+        _phonebook_refresh_thread = threading.Thread(
+            target=_refresh_phonebook_in_background,
+            name="phonebook-refresh",
+            daemon=True,
+        )
+        _phonebook_refresh_thread.start()
+
+
 def get_phonebook_lookup() -> Optional[PhonebookLookup]:
     """Create a singleton phonebook lookup instance if enabled via env vars.
 
@@ -545,19 +593,19 @@ def get_phonebook_lookup() -> Optional[PhonebookLookup]:
     needs_blob_refresh = (not path) and (now - _last_blob_refresh >= _BLOB_REFRESH_INTERVAL)
 
     if not path:
-        path = _download_phonebook_from_blob_to_cache(force_download=needs_blob_refresh) or ""
-        if needs_blob_refresh and path:
-            _last_blob_refresh = now
+        if _phonebook_singleton is not None and needs_blob_refresh:
+            _start_background_phonebook_refresh()
+            path = _phonebook_singleton.xlsx_path
+        else:
+            path = _download_phonebook_from_blob_to_cache(force_download=needs_blob_refresh) or ""
+            if needs_blob_refresh and path:
+                _last_blob_refresh = now
     if not path:
         return None
 
     if _phonebook_singleton is None or _phonebook_singleton.xlsx_path != path:
         _phonebook_singleton = PhonebookLookup(path)
     elif needs_blob_refresh:
-        # Same path but blob was re-downloaded — force reload of index
-        _phonebook_singleton._loaded = False
-        _phonebook_singleton._index.clear()
-        _phonebook_singleton.load()
-        logger.info("[PHONEBOOK] Refreshed from blob storage")
+        _start_background_phonebook_refresh()
 
     return _phonebook_singleton

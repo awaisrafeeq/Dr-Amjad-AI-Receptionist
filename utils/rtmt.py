@@ -77,11 +77,14 @@ class RTMiddleTier:
             from utils.phonebook_lookup import get_phonebook_lookup
             pb = get_phonebook_lookup()
             if pb:
-                logger.info(f"[PHONE BOOK] Preloaded {len(pb._df)} entries")
+                pb.load()
+                logger.info(
+                    f"[PHONE BOOK] Preloaded {pb._entry_count} entries across {len(pb._index)} phone variants"
+                )
             else:
                 logger.warning("[PHONE BOOK] Not available at startup")
         except Exception as e:
-            logger.debug(f"[PHONE BOOK] Preload skipped: {e}")
+            logger.warning(f"[PHONE BOOK] Preload skipped: {e}")
 
     def _load_prompt(self) -> Optional[str]:
         """Load system prompt from file and track its modification time."""
@@ -474,6 +477,7 @@ class RTMiddleTier:
                     async def from_server_to_client():
                         nonlocal last_user_activity_ts, last_prompt_stage, session_id, detected_conversation_language
                         nonlocal suppress_agent_audio, cancel_sent_for_current_turn, response_active, speech_stop_time, unsuppress_scheduled
+                        nonlocal _transcription_flush_task
                         try:
                             async for msg in target_ws:
                                 if msg.type == aiohttp.WSMsgType.TEXT:
