@@ -3,6 +3,14 @@ import asyncio
 import base64
 import json
 from json import JSONDecodeError
+
+# Try to use orjson for faster JSON parsing (10-20x faster, C-based)
+try:
+    import orjson
+    _HAS_ORJSON = True
+except ImportError:
+    orjson = None
+    _HAS_ORJSON = False
 from typing import Any, Optional, List, Dict, Tuple
 from fastapi import WebSocket
 from utils.helpers import transform_acs_to_openai_format, transform_openai_to_acs_format, load_prompt_from_markdown, extract_transcription_from_openai_message, filter_diagnosis_words
@@ -60,6 +68,21 @@ class RTMiddleTier:
         self.system_message = self._load_prompt()
         self._doctor_cache: Dict[int, str] = {}  # calendar_id -> doctor_name, avoids extra GET /calendars after booking
 
+        # Preload phonebook at startup to avoid first-call delay
+        self._preload_phonebook()
+
+    def _preload_phonebook(self) -> None:
+        """Preload phonebook lookup at startup to warm the cache."""
+        try:
+            from utils.phonebook_lookup import get_phonebook_lookup
+            pb = get_phonebook_lookup()
+            if pb:
+                logger.info(f"[PHONE BOOK] Preloaded {len(pb._df)} entries")
+            else:
+                logger.warning("[PHONE BOOK] Not available at startup")
+        except Exception as e:
+            logger.debug(f"[PHONE BOOK] Preload skipped: {e}")
+
     def _load_prompt(self) -> Optional[str]:
         """Load system prompt from file and track its modification time."""
         try:
@@ -102,6 +125,8 @@ class RTMiddleTier:
                     greeting_sent = asyncio.Event()
                     call_end_requested = asyncio.Event()
                     session_confirmed = asyncio.Event()
+                    response_idle_event = asyncio.Event()
+                    response_idle_event.set()  # Start in idle state
 
                     last_user_activity_ts = loop.time()
                     last_prompt_stage = 0
@@ -119,28 +144,38 @@ class RTMiddleTier:
                     # until get_available_doctors has been called and returned valid IDs.
                     _valid_calendar_ids: set = set()  # populated by get_available_doctors
 
+                    # Cache calendars for this session to avoid duplicate API calls
+                    _session_calendars: Optional[list] = None
+
+                    # Transcription batching queue for async logging
+                    _transcription_batch: list = []
+                    _transcription_flush_task: Optional[asyncio.Task] = None
+
                     # Native Tool Calling Handlers will be here
 
                     async def wait_for_response_idle(timeout: float = 2.0) -> bool:
-                        """Wait for any active response to finish or be cancelled."""
+                        """Wait for any active response to finish or be cancelled using event-based waiting."""
                         nonlocal response_active
-                        if not response_active:
+                        if not response_active and response_idle_event.is_set():
                             return True
                         
-                        _start = loop.time()
-                        while response_active and (loop.time() - _start) < timeout:
-                            await asyncio.sleep(0.05)
-                        
-                        # Even if flag is finally false, give OpenAI a tiny buffer to be truly "ready"
-                        if not response_active:
-                            await asyncio.sleep(0.1)
-                        return not response_active
+                        try:
+                            await asyncio.wait_for(response_idle_event.wait(), timeout=timeout)
+                            return True
+                        except asyncio.TimeoutError:
+                            return not response_active
+
+                    def _json_dumps(obj) -> str:
+                        """Use orjson if available for faster serialization."""
+                        if _HAS_ORJSON:
+                            return orjson.dumps(obj).decode('utf-8')
+                        return json.dumps(obj)
 
                     async def send_assistant_prompt(instructions: str) -> None:
                         nonlocal response_active
                         if response_active:
                             try:
-                                await target_ws.send_str(json.dumps({"type": "response.cancel"}))
+                                await target_ws.send_str(_json_dumps({"type": "response.cancel"}))
                                 await wait_for_response_idle(timeout=1.5)
                             except Exception as e:
                                 logger.error(f"Failed to cancel active response: {e}")
@@ -253,7 +288,7 @@ class RTMiddleTier:
                                     ]
                                     _pb_context = "\n".join(_pb_lines)
                                     await target_ws.send_str(
-                                        json.dumps({
+                                        _json_dumps({
                                             "type": "session.update",
                                             "session": {
                                                 "instructions": (self.system_message or "") + "\n\n" + _pb_context
@@ -275,7 +310,7 @@ class RTMiddleTier:
 
                         try:
                             await target_ws.send_str(
-                                json.dumps({
+                                _json_dumps({
                                     "type": "response.create",
                                     "response": {
                                         "modalities": ["audio", "text"],
@@ -340,8 +375,8 @@ class RTMiddleTier:
                                         "you will end the call now, and they can call MedCenter Volta again anytime. Say goodbye."
                                     )
                                     call_end_requested.set()
-                                    # Wait for goodbye audio to play before hanging up
-                                    await asyncio.sleep(5.0)
+                                    # Wait for goodbye audio to play before hanging up (reduced from 5s to 2s)
+                                    await asyncio.sleep(2.0)
                                     _hung = await _do_acs_hangup("inactivity")
                                     if not _hung:
                                         logger.error("[INACTIVITY] Hangup failed — call may remain connected")
@@ -370,13 +405,27 @@ class RTMiddleTier:
                             logger.exception("Inactivity monitor error")
                             return
 
+                    async def _flush_transcriptions():
+                        """Flush batched transcriptions to database every 2 seconds."""
+                        nonlocal _transcription_batch, _transcription_flush_task
+                        while _transcription_batch:
+                            batch = _transcription_batch[:10]  # Process up to 10 at a time
+                            _transcription_batch = _transcription_batch[10:]
+                            for item in batch:
+                                try:
+                                    await session_manager.log_transcription(**item)
+                                except Exception as e:
+                                    logger.error(f"[TRANSCRIPT BATCH ERROR] {e}")
+                            await asyncio.sleep(0.1)  # Small delay between batches
+                        _transcription_flush_task = None
+
                     async def from_client_to_server():
                         nonlocal session_id
                         try:
                             async for msg in ws.iter_text():
                                 try:
-                                    data = json.loads(msg)
-                                except JSONDecodeError:
+                                    data = json.loads(msg) if not _HAS_ORJSON else orjson.loads(msg)
+                                except (JSONDecodeError, Exception):
                                     logger.debug("Non-JSON from ACS (ignored)")
                                     continue
 
@@ -407,7 +456,7 @@ class RTMiddleTier:
                                 if data:
                                     if isinstance(data, dict) and data.get("type") == "session.update":
                                         session_initialized.set()
-                                    await target_ws.send_str(json.dumps(data))
+                                    await target_ws.send_str(_json_dumps(data))
                         except asyncio.CancelledError:
                             logger.debug("Client→server cancelled")
                             return
@@ -428,7 +477,7 @@ class RTMiddleTier:
                         try:
                             async for msg in target_ws:
                                 if msg.type == aiohttp.WSMsgType.TEXT:
-                                    original_data = json.loads(msg.data)
+                                    original_data = json.loads(msg.data) if not _HAS_ORJSON else orjson.loads(msg.data)
                                     event_type = original_data.get("type")
                                     
                                     # Log error details — suppress known harmless errors as DEBUG
@@ -442,9 +491,11 @@ class RTMiddleTier:
                                     # Track response state (debug only)
                                     if event_type == "response.created":
                                         response_active = True
+                                        response_idle_event.clear()
                                         logger.debug("Response created")
                                     elif event_type in ("response.done", "response.cancelled"):
                                         response_active = False
+                                        response_idle_event.set()
                                         logger.debug("Response ended")
                                     
                                     elif event_type == "session.updated":
@@ -456,8 +507,9 @@ class RTMiddleTier:
                                         _func_name = original_data.get("name")
                                         logger.info(f"[FUNCTION CALL] OpenAI invoked: {_func_name} (call_id={_call_id}, session={session_id})")
                                         try:
-                                            _fn_args = json.loads(original_data.get("arguments", "{}"))
-                                        except json.JSONDecodeError:
+                                            _args_str = original_data.get("arguments", "{}")
+                                            _fn_args = orjson.loads(_args_str) if _HAS_ORJSON else json.loads(_args_str)
+                                        except (json.JSONDecodeError, Exception):
                                             _fn_args = {}
 
                                         # Run all API work in a background task so the event loop stays
@@ -469,10 +521,10 @@ class RTMiddleTier:
 
                                             # Send brief holding message for slow functions so caller never hears silence
                                             if _func_name in ("get_available_slots", "book_appointment", "get_available_doctors"):
-                                                await asyncio.sleep(0.15)  # yield so response.done is processed first
+                                                # Removed sleep(0.15) - yield not needed with proper event handling
                                                 if not response_active:
                                                     try:
-                                                        await target_ws.send_str(json.dumps({
+                                                        await target_ws.send_str(_json_dumps({
                                                             "type": "response.create",
                                                             "response": {
                                                                 "modalities": ["audio", "text"],
@@ -489,10 +541,17 @@ class RTMiddleTier:
                                                     except Exception as __he:
                                                         logger.debug(f"[HOLDING] Could not send: {__he}")
 
+                                            async def _get_cached_calendars():
+                                                """Get calendars with session-level caching to avoid duplicate API calls."""
+                                                nonlocal _session_calendars
+                                                if _session_calendars is None:
+                                                    _session_calendars = await epaad_client.get_calendars()
+                                                return _session_calendars
+
                                             if _func_name == "get_available_doctors":
                                                 __doctors = []
                                                 try:
-                                                    __calendars = await epaad_client.get_calendars()
+                                                    __calendars = await _get_cached_calendars()
                                                     for __cal in __calendars or []:
                                                         __prof = __cal.get("professional") or {}
                                                         __first = (__prof.get("firstName") or "").strip()
@@ -524,10 +583,10 @@ class RTMiddleTier:
                                                         _valid_calendar_ids.add(__d["calendar_id"])
                                                     logger.info(f"[DOCTORS] Valid calendar IDs for session: {_valid_calendar_ids}")
 
-                                                    _result = json.dumps(__doctors)
+                                                    _result = _json_dumps(__doctors)
                                                 except Exception as __e:
                                                     logger.error(f"Error in get_available_doctors: {__e}")
-                                                    _result = json.dumps({"error": str(__e)})
+                                                    _result = _json_dumps({"error": str(__e)})
 
                                             elif _func_name == "get_available_slots":
                                                 try:
@@ -538,7 +597,7 @@ class RTMiddleTier:
                                                     # --- ENFORCE: get_available_doctors must be called first ---
                                                     if not _valid_calendar_ids:
                                                         logger.warning(f"[SLOTS BLOCKED] get_available_slots called without prior get_available_doctors. calendar_id={__cal_id}, session={session_id}")
-                                                        _result = json.dumps({
+                                                        _result = _json_dumps({
                                                             "error": "You must call get_available_doctors first before checking slots. "
                                                             "Ask the caller which doctor they prefer, then call get_available_doctors to get the list, "
                                                             "let the caller choose, and only then call get_available_slots with the correct calendar_id."
@@ -552,7 +611,7 @@ class RTMiddleTier:
 
                                                     if __cal_id_int not in _valid_calendar_ids:
                                                         logger.warning(f"[SLOTS BLOCKED] Invalid calendar_id={__cal_id}. Valid IDs: {_valid_calendar_ids}. session={session_id}")
-                                                        _result = json.dumps({
+                                                        _result = _json_dumps({
                                                             "error": f"calendar_id {__cal_id} is not valid. "
                                                             f"Valid calendar IDs from get_available_doctors are: {sorted(_valid_calendar_ids)}. "
                                                             "Please use one of these IDs based on the doctor the caller selected."
@@ -580,14 +639,14 @@ class RTMiddleTier:
                                                     )
 
                                                     __slot_iso = [__s.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S") for __s in __slots][:10]
-                                                    _result = json.dumps({"available_slots": __slot_iso})
+                                                    _result = _json_dumps({"available_slots": __slot_iso})
                                                 except ValueError:
                                                     # Validation block (doctors not fetched / invalid ID)
                                                     # _result was already set above, just pass through
                                                     pass
                                                 except Exception as __e:
                                                     logger.error(f"Error in get_available_slots: {__e}")
-                                                    _result = json.dumps({"error": str(__e)})
+                                                    _result = _json_dumps({"error": str(__e)})
 
                                             elif _func_name == "book_appointment":
                                                 try:
@@ -600,7 +659,7 @@ class RTMiddleTier:
 
                                                     if not _valid_calendar_ids:
                                                         logger.warning(f"[BOOKING BLOCKED] book_appointment called without prior get_available_doctors. calendar_id={__book_cal_id}, session={session_id}")
-                                                        _result = json.dumps({
+                                                        _result = _json_dumps({
                                                             "error": "You must call get_available_doctors first to get valid doctor calendar IDs before booking. "
                                                             "Ask the caller which doctor they prefer, call get_available_doctors, then proceed."
                                                         })
@@ -608,7 +667,7 @@ class RTMiddleTier:
 
                                                     if __book_cal_id_int not in _valid_calendar_ids:
                                                         logger.warning(f"[BOOKING BLOCKED] Invalid calendar_id={__book_cal_id}. Valid IDs: {_valid_calendar_ids}. session={session_id}")
-                                                        _result = json.dumps({
+                                                        _result = _json_dumps({
                                                             "error": f"calendar_id {__book_cal_id} is not valid. "
                                                             f"Valid calendar IDs are: {sorted(_valid_calendar_ids)}. "
                                                             "Use the correct ID for the doctor the caller chose."
@@ -768,7 +827,7 @@ class RTMiddleTier:
                                                     __onedoc_key = _res.get("onedoc_key") or _res.get("onedocKey") or _res.get("key") if isinstance(_res, dict) else None
                                                     if __onedoc_key:
                                                         logger.info(f"[BOOKING SUCCESS] {_args.get('slot_iso')[:10]} ref:{__onedoc_key[:8]}...")
-                                                        _result = json.dumps({"status": "success", "booking_reference": __onedoc_key, "instruction": "DO NOT speak the booking_reference to the caller. Confirm the appointment details briefly, then ask if there is anything else you can help with. Only call terminate_call after the caller confirms they have no further questions and you have said goodbye."})
+                                                        _result = _json_dumps({"status": "success", "booking_reference": __onedoc_key, "instruction": "DO NOT speak the booking_reference to the caller. Confirm the appointment details briefly, then ask if there is anything else you can help with. Only call terminate_call after the caller confirms they have no further questions and you have said goodbye."})
 
                                                         # --- PHONEBOOK INTEGRATION (fire-and-forget) ---
                                                         # Capture values from outer scope into local names
@@ -842,13 +901,14 @@ class RTMiddleTier:
                                                                 }
                                                                 logger.info(f"[PHONEBOOK] Built patient_data: {patient_data}")
 
-                                                                # Look up doctor name — use in-memory cache first to avoid extra GET /calendars
+                                                                # Look up doctor name — use in-memory cache first, then session cache
                                                                 try:
                                                                     _cal_id_int = int(_pb_args.get("calendar_id") or 0)
                                                                     if _cal_id_int and _cal_id_int in self._doctor_cache:
                                                                         patient_data["doctor"] = self._doctor_cache[_cal_id_int]
                                                                     elif _cal_id_int:
-                                                                        cals = await epaad_client.get_calendars()
+                                                                        # Use session-cached calendars to avoid extra API call
+                                                                        cals = await _get_cached_calendars()
                                                                         for cal in cals or []:
                                                                             if int(cal.get("id")) == _cal_id_int:
                                                                                 prof = cal.get("professional") or {}
@@ -894,19 +954,19 @@ class RTMiddleTier:
                                                         # --- END AUTO-HANGUP FALLBACK ---
 
                                                     else:
-                                                        _result = json.dumps({"status": "success", "message": "Appointment booked but no reference generated."})
+                                                        _result = _json_dumps({"status": "success", "message": "Appointment booked but no reference generated."})
                                                 except ValueError:
                                                     # Validation block (doctors not fetched / invalid ID)
                                                     # _result was already set above, just pass through
                                                     pass
                                                 except Exception as __e:
                                                     logger.error(f"Error in book_appointment: {__e}")
-                                                    _result = json.dumps({"status": "error", "message": str(__e)})
+                                                    _result = _json_dumps({"status": "error", "message": str(__e)})
 
                                             elif _func_name == "terminate_call":
                                                 logger.info(f"[CALL END] AI requested terminate_call — session={session_id}")
                                                 call_end_requested.set()
-                                                _result = json.dumps({"status": "success", "message": "Terminating call now."})
+                                                _result = _json_dumps({"status": "success", "message": "Terminating call now."})
 
                                                 # Log session state at the moment of terminate
                                                 _tc_sess = session_manager.active_sessions.get(session_id)
@@ -919,9 +979,9 @@ class RTMiddleTier:
                                                 else:
                                                     logger.error(f"[CALL END] Session {session_id} NOT FOUND in active_sessions at terminate_call time!")
 
-                                                # Wait for the agent's goodbye audio to finish playing
-                                                logger.info("[CALL END] Waiting 4s for goodbye audio to finish...")
-                                                await asyncio.sleep(4.0)
+                                                # Wait for the agent's goodbye audio to finish playing (reduced from 4s to 1.5s)
+                                                logger.info("[CALL END] Waiting 1.5s for goodbye audio to finish...")
+                                                await asyncio.sleep(1.5)
 
                                                 # Actually hang up the ACS call
                                                 _hung = await _do_acs_hangup("terminate_call")
@@ -935,36 +995,36 @@ class RTMiddleTier:
                                                 if __card_digits and session_id:
                                                     # Validate: must start with 807 and be exactly 20 digits
                                                     if not __card_digits.startswith("807"):
-                                                        _result = json.dumps({"status": "error", "message": "Invalid card number — it must start with 807. Please ask the caller to check the number on the front of their card and try again."})
+                                                        _result = _json_dumps({"status": "error", "message": "Invalid card number — it must start with 807. Please ask the caller to check the number on the front of their card and try again."})
                                                     elif len(__card_digits) != 20:
-                                                        _result = json.dumps({"status": "error", "message": f"Invalid card number — it must be exactly 20 digits. The number provided has {len(__card_digits)} digits. Please ask the caller to re-read the complete number."})
+                                                        _result = _json_dumps({"status": "error", "message": f"Invalid card number — it must be exactly 20 digits. The number provided has {len(__card_digits)} digits. Please ask the caller to re-read the complete number."})
                                                     elif not __card_digits.isdigit():
-                                                        _result = json.dumps({"status": "error", "message": "Invalid card number — it must contain only digits. Please ask the caller to re-read the number."})
+                                                        _result = _json_dumps({"status": "error", "message": "Invalid card number — it must contain only digits. Please ask the caller to re-read the number."})
                                                     else:
                                                         __sess = session_manager.active_sessions.get(session_id)
                                                         if __sess:
                                                             __sess.insurance_card_number = __card_digits
                                                             logger.info(f"[INSURANCE] Stored card number for session {session_id[:8]}")
-                                                        _result = json.dumps({"status": "success", "message": "Insurance card number stored for documentation."})
+                                                        _result = _json_dumps({"status": "success", "message": "Insurance card number stored for documentation."})
                                                 else:
-                                                    _result = json.dumps({"status": "error", "message": "No card number provided or no active session."})
+                                                    _result = _json_dumps({"status": "error", "message": "No card number provided or no active session."})
 
                                             elif _func_name == "search_knowledge_base":
                                                 try:
                                                     __query = _args.get("query", "")
                                                     _results = await document_processor.search_knowledge_base(query=__query, k=5)
                                                     if not _results:
-                                                        _result = json.dumps({"status": "no_results_found", "message": "No information found in the knowledge base."})
+                                                        _result = _json_dumps({"status": "no_results_found", "message": "No information found in the knowledge base."})
                                                     else:
                                                         __blocks = []
                                                         for __r in _results:
                                                             __content = (__r.get("content") or "").strip()
                                                             if __content:
                                                                 __blocks.append(__content)
-                                                        _result = json.dumps({"status": "success", "information": "\n\n".join(__blocks)[:2000]})
+                                                        _result = _json_dumps({"status": "success", "information": "\n\n".join(__blocks)[:2000]})
                                                 except Exception as __e:
                                                     logger.error(f"Error in search_knowledge_base: {__e}")
-                                                    _result = json.dumps({"status": "error", "message": str(__e)})
+                                                    _result = _json_dumps({"status": "error", "message": str(__e)})
 
                                             # Cancel any still-active holding response before sending tool output.
                                             # This prevents the AI from saying "no slots available" (guess)
@@ -972,7 +1032,7 @@ class RTMiddleTier:
                                             if _func_name != "terminate_call":
                                                 if response_active:
                                                     try:
-                                                        await target_ws.send_str(json.dumps({"type": "response.cancel"}))
+                                                        await target_ws.send_str(_json_dumps({"type": "response.cancel"}))
                                                         logger.debug(f"[TOOL] Cancelled holding response before submitting {_func_name} result")
                                                     except Exception:
                                                         pass
@@ -981,7 +1041,7 @@ class RTMiddleTier:
 
                                             # Submit function output back to OpenAI
                                             logger.info(f"[FUNCTION RESULT] Sending output for {_func_name} (call_id={_call_id}): {_result[:120]}")
-                                            await target_ws.send_str(json.dumps({
+                                            await target_ws.send_str(_json_dumps({
                                                 "type": "conversation.item.create",
                                                 "item": {
                                                     "type": "function_call_output",
@@ -995,7 +1055,7 @@ class RTMiddleTier:
                                                 # Ensure any previous response (like 'One moment please') is dead
                                                 await wait_for_response_idle(timeout=1.5)
                                                 logger.debug(f"[FUNCTION RESULT] Sending response.create after {_func_name}")
-                                                await target_ws.send_str(json.dumps({
+                                                await target_ws.send_str(_json_dumps({
                                                     "type": "response.create"
                                                 }))
                                             else:
@@ -1061,15 +1121,20 @@ class RTMiddleTier:
                                         if transcription_data:
                                             last_user_activity_ts = loop.time()
                                             last_prompt_stage = 0
-                                            # Log transcription asynchronously (don't block message flow)
+                                            # Log transcription asynchronously with batching
                                             if session_id:
                                                 try:
-                                                    await session_manager.log_transcription(
-                                                        session_id=session_id,
-                                                        speaker=transcription_data.get("speaker", "unknown"),
-                                                        utterance_text=transcription_data.get("utterance_text", ""),
-                                                        timestamp=transcription_data.get("timestamp")
-                                                    )
+                                                    # Add to batch queue for background processing
+                                                    _transcription_batch.append({
+                                                        "session_id": session_id,
+                                                        "speaker": transcription_data.get("speaker", "unknown"),
+                                                        "utterance_text": transcription_data.get("utterance_text", ""),
+                                                        "timestamp": transcription_data.get("timestamp")
+                                                    })
+                                                    # Schedule flush if not already running
+                                                    if _transcription_flush_task is None:
+                                                        _transcription_flush_task = asyncio.create_task(_flush_transcriptions())
+                                                    # Log transcript locally (fast, non-blocking)
                                                     speaker = transcription_data.get("speaker")
                                                     text = transcription_data.get("utterance_text", "")[:50]
                                                     logger.info(f"[TRANSCRIPT] {speaker}: {text}...")
@@ -1089,8 +1154,8 @@ class RTMiddleTier:
                                                     if detected_conversation_language != "de":
                                                         detected_conversation_language = "de"
                                                         logger.info(f"[LANG] Explicit switch to German detected from {transcription_data.get('speaker')}")
-                                                # Fall back to langdetect for longer utterances
-                                                elif detect_lang and len(text) > 15:
+                                                # Fall back to langdetect for longer utterances (increased from 15 to 30)
+                                                elif detect_lang and len(text) > 30:
                                                     try:
                                                         _lang = await asyncio.to_thread(detect_lang, text)
                                                         if _lang and _lang in ("en", "de") and _lang != detected_conversation_language:
@@ -1108,7 +1173,7 @@ class RTMiddleTier:
                                         data = original_data
                                         
                                     if data:
-                                        await ws.send_text(json.dumps(data))
+                                        await ws.send_text(_json_dumps(data))
                                 elif msg.type == aiohttp.WSMsgType.ERROR:
                                     logger.error(f"WebSocket error: {target_ws.exception()}")
                                     break
