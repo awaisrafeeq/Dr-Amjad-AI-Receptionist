@@ -22,7 +22,7 @@ from difflib import SequenceMatcher
 from utils.session_manager import session_manager
 from utils.document_utils import document_processor
 from utils.epaad_client import epaad_client
-from utils.availability import compute_free_slots, default_opening_hours
+from utils.availability import build_slot_recommendation, compute_free_slots, default_opening_hours
 
 try:
     from langdetect import detect as detect_lang
@@ -643,7 +643,13 @@ class RTMiddleTier:
                                                     )
 
                                                     __slot_iso = [__s.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S") for __s in __slots][:10]
-                                                    _result = _json_dumps({"available_slots": __slot_iso})
+                                                    __recommendation = build_slot_recommendation(
+                                                        slots=__slots,
+                                                        target_date=__target_day,
+                                                        requested_time_of_day=__tod,
+                                                    )
+                                                    __recommendation["available_slots"] = __slot_iso
+                                                    _result = _json_dumps(__recommendation)
                                                 except ValueError:
                                                     # Validation block (doctors not fetched / invalid ID)
                                                     # _result was already set above, just pass through

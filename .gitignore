@@ -41,3 +41,4 @@ venv/
 !requirements.txt
 !README.md
 !system_prompt.md
+deployment.zip

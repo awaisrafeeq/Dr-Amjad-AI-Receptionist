@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Dict, Iterable, List, Literal, Optional, Tuple
 
@@ -16,6 +16,25 @@ TimeOfDay = Literal["morning", "afternoon", "any"]
 class OpeningHours:
     # weekday: 0=Mon .. 6=Sun
     windows_by_weekday: Dict[int, List[Tuple[time, time]]]
+
+
+@dataclass
+class SlotOffer:
+    startDateTime: str
+    label: str
+
+
+@dataclass
+class SlotRecommendation:
+    day: str
+    requested_time_of_day: TimeOfDay
+    has_morning: bool
+    has_afternoon: bool
+    best_window: Optional[TimeOfDay]
+    window_phrase: Optional[str]
+    primary_offer: Optional[SlotOffer]
+    alternative_offer: Optional[SlotOffer]
+    remaining_options_count: int
 
 
 DEFAULT_TZ = os.getenv("EPAAD_TIMEZONE", "Europe/Zurich")
@@ -192,3 +211,109 @@ def compute_free_slots(
             cursor += step
 
     return slots
+
+
+def _window_for_slot(slot: datetime) -> TimeOfDay:
+    return "morning" if slot.time() < time(12, 0) else "afternoon"
+
+
+def _window_phrase(slots: List[datetime], window: TimeOfDay) -> Optional[str]:
+    if not slots:
+        return None
+
+    if window == "morning":
+        latest = max(s.time() for s in slots)
+        if latest >= time(11, 0):
+            return "late morning"
+        if latest >= time(9, 30):
+            return "morning"
+        return "early morning"
+
+    earliest = min(s.time() for s in slots)
+    latest = max(s.time() for s in slots)
+    if earliest <= time(14, 0) and latest <= time(15, 30):
+        return "early afternoon"
+    if earliest >= time(15, 0):
+        return "late afternoon"
+    return "afternoon"
+
+
+def _format_offer(slot: datetime) -> SlotOffer:
+    return SlotOffer(
+        startDateTime=slot.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S"),
+        label=slot.strftime("%H:%M"),
+    )
+
+
+def _rank_slots(slots: List[datetime], requested_time_of_day: TimeOfDay) -> List[datetime]:
+    if not slots:
+        return []
+
+    if requested_time_of_day == "morning":
+        return sorted(slots, key=lambda s: (-s.hour, -s.minute))
+
+    if requested_time_of_day == "afternoon":
+        target = time(15, 0)
+        return sorted(
+            slots,
+            key=lambda s: (abs((s.hour * 60 + s.minute) - (target.hour * 60 + target.minute)), s.hour, s.minute),
+        )
+
+    def _any_score(slot: datetime) -> Tuple[int, int]:
+        window = _window_for_slot(slot)
+        preferred_minutes = 11 * 60 + 30 if window == "morning" else 15 * 60
+        slot_minutes = slot.hour * 60 + slot.minute
+        window_priority = 0 if window == "morning" else 1
+        return (window_priority, abs(slot_minutes - preferred_minutes))
+
+    return sorted(slots, key=_any_score)
+
+
+def build_slot_recommendation(
+    *,
+    slots: List[datetime],
+    target_date: date,
+    requested_time_of_day: TimeOfDay,
+) -> Dict[str, object]:
+    morning_slots = [s for s in slots if _window_for_slot(s) == "morning"]
+    afternoon_slots = [s for s in slots if _window_for_slot(s) == "afternoon"]
+
+    preferred_slots: List[datetime]
+    best_window: Optional[TimeOfDay]
+
+    if requested_time_of_day == "morning":
+        preferred_slots = morning_slots
+        best_window = "morning" if preferred_slots else ("afternoon" if afternoon_slots else None)
+    elif requested_time_of_day == "afternoon":
+        preferred_slots = afternoon_slots
+        best_window = "afternoon" if preferred_slots else ("morning" if morning_slots else None)
+    else:
+        preferred_slots = slots
+        if morning_slots:
+            best_window = "morning"
+        elif afternoon_slots:
+            best_window = "afternoon"
+        else:
+            best_window = None
+
+    if requested_time_of_day in ("morning", "afternoon") and not preferred_slots:
+        preferred_slots = afternoon_slots if requested_time_of_day == "morning" else morning_slots
+
+    ranked = _rank_slots(preferred_slots, requested_time_of_day if preferred_slots else "any")
+    primary_offer = _format_offer(ranked[0]) if ranked else None
+    alternative_offer = _format_offer(ranked[1]) if len(ranked) > 1 else None
+
+    active_window_slots = morning_slots if best_window == "morning" else afternoon_slots if best_window == "afternoon" else []
+
+    recommendation = SlotRecommendation(
+        day=target_date.isoformat(),
+        requested_time_of_day=requested_time_of_day,
+        has_morning=bool(morning_slots),
+        has_afternoon=bool(afternoon_slots),
+        best_window=best_window,
+        window_phrase=_window_phrase(active_window_slots, best_window) if best_window else None,
+        primary_offer=primary_offer,
+        alternative_offer=alternative_offer,
+        remaining_options_count=max(0, len(ranked) - (1 if primary_offer else 0) - (1 if alternative_offer else 0)),
+    )
+    return asdict(recommendation)

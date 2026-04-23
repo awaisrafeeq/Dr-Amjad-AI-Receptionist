@@ -58,7 +58,7 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                     {
                         "type": "function",
                         "name": "get_available_slots",
-                        "description": "Get a list of available appointment slots for a specific doctor on a specific date. MANDATORY: You MUST NOT call this tool until the caller has specifically chosen a doctor or confirmed their preferred practitioner in Step A3.",
+                        "description": "Get appointment availability for a specific doctor on a specific date. IMPORTANT: Use the returned availability summary plus the primary_offer and alternative_offer to guide the caller. Do NOT read out the full slot list unless the caller explicitly asks for more options. MANDATORY: You MUST NOT call this tool until the caller has specifically chosen a doctor or confirmed their preferred practitioner in Step A3.",
                         "parameters": {
                             "type": "object",
                             "properties": {
