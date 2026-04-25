@@ -71,6 +71,21 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                     },
                     {
                         "type": "function",
+                        "name": "get_next_available_slot",
+                        "description": "Find the earliest available appointment for a selected doctor across the next 14 days by default. Use this when the caller asks for the next available, earliest, soonest, any day, every day, this week if possible, or says they are flexible. Do NOT ask for an exact date again in those cases. Offer only the primary_offer first, then the alternative_offer only if needed.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "calendar_id": {"type": "integer", "description": "The calendar ID of the doctor."},
+                                "time_of_day": {"type": "string", "enum": ["morning", "afternoon", "any"], "description": "Optional preferred time of day. Use 'any' when the caller is flexible."},
+                                "start_date": {"type": "string", "description": "Optional search start date in YYYY-MM-DD format. Defaults to today."},
+                                "search_window_days": {"type": "integer", "description": "Optional number of days to search. Defaults to 14 and should normally remain 14."}
+                            },
+                            "required": ["calendar_id"]
+                        }
+                    },
+                    {
+                        "type": "function",
                         "name": "book_appointment",
                         "description": "Book an appointment for a patient. All required fields must be populated with real data before calling.",
                         "parameters": {

@@ -87,7 +87,6 @@ def _cell_to_str(value: Any) -> Optional[str]:
     except Exception:
         return None
 
-
 import time as _time
 
 _last_blob_refresh: float = 0.0
@@ -460,8 +459,6 @@ class PhonebookLookup:
             matches = self._index.get(v)
             if matches:
                 return matches[0]
-
-        return None
 
     def lookup_by_phone_and_name(self, phone: Optional[str], first_name: Optional[str], last_name: Optional[str]) -> Optional[PhonebookMatch]:
         """Returns the phonebook match for the given phone number that also matches the provided name."""

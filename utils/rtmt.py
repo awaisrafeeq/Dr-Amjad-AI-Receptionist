@@ -22,7 +22,7 @@ from difflib import SequenceMatcher
 from utils.session_manager import session_manager
 from utils.document_utils import document_processor
 from utils.epaad_client import epaad_client
-from utils.availability import build_slot_recommendation, compute_free_slots, default_opening_hours
+from utils.availability import build_next_available_recommendation, build_slot_recommendation, compute_free_slots, default_opening_hours
 
 try:
     from langdetect import detect as detect_lang
@@ -524,7 +524,7 @@ class RTMiddleTier:
                                             _result = ""
 
                                             # Send brief holding message for slow functions so caller never hears silence
-                                            if _func_name in ("get_available_slots", "book_appointment", "get_available_doctors"):
+                                            if _func_name in ("get_available_slots", "get_next_available_slot", "book_appointment", "get_available_doctors"):
                                                 # Removed sleep(0.15) - yield not needed with proper event handling
                                                 if not response_active:
                                                     try:
@@ -656,6 +656,108 @@ class RTMiddleTier:
                                                     pass
                                                 except Exception as __e:
                                                     logger.error(f"Error in get_available_slots: {__e}")
+                                                    _result = _json_dumps({"error": str(__e)})
+
+                                            elif _func_name == "get_next_available_slot":
+                                                try:
+                                                    __cal_id = _args.get("calendar_id")
+                                                    __tod = _args.get("time_of_day", "any")
+                                                    if __tod not in ("morning", "afternoon", "any"):
+                                                        __tod = "any"
+
+                                                    # Keep the production default predictable and bounded.
+                                                    try:
+                                                        __search_window_days = int(_args.get("search_window_days") or 14)
+                                                    except (TypeError, ValueError):
+                                                        __search_window_days = 14
+                                                    __search_window_days = max(1, min(__search_window_days, 14))
+
+                                                    # --- ENFORCE: get_available_doctors must be called first ---
+                                                    if not _valid_calendar_ids:
+                                                        logger.warning(f"[NEXT SLOT BLOCKED] get_next_available_slot called without prior get_available_doctors. calendar_id={__cal_id}, session={session_id}")
+                                                        _result = _json_dumps({
+                                                            "error": "You must call get_available_doctors first before checking next available slots. "
+                                                            "Ask the caller which doctor they prefer, then call get_available_doctors to get the list, "
+                                                            "let the caller choose, and only then call get_next_available_slot with the correct calendar_id."
+                                                        })
+                                                        raise ValueError("blocked: doctors not fetched")
+
+                                                    try:
+                                                        __cal_id_int = int(__cal_id)
+                                                    except (TypeError, ValueError):
+                                                        __cal_id_int = None
+
+                                                    if __cal_id_int not in _valid_calendar_ids:
+                                                        logger.warning(f"[NEXT SLOT BLOCKED] Invalid calendar_id={__cal_id}. Valid IDs: {_valid_calendar_ids}. session={session_id}")
+                                                        _result = _json_dumps({
+                                                            "error": f"calendar_id {__cal_id} is not valid. "
+                                                            f"Valid calendar IDs from get_available_doctors are: {sorted(_valid_calendar_ids)}. "
+                                                            "Please use one of these IDs based on the doctor the caller selected."
+                                                        })
+                                                        raise ValueError("blocked: invalid calendar_id")
+                                                    # --- END ENFORCEMENT ---
+
+                                                    __now_dt = datetime.now(ZoneInfo("Europe/Zurich"))
+                                                    __start_date_arg = (_args.get("start_date") or "").strip()
+                                                    if __start_date_arg:
+                                                        try:
+                                                            __start_day = date.fromisoformat(__start_date_arg)
+                                                        except ValueError:
+                                                            __start_day = __now_dt.date()
+                                                        if __start_day < __now_dt.date():
+                                                            __start_day = __now_dt.date()
+                                                    else:
+                                                        __start_day = __now_dt.date()
+
+                                                    __end_day = __start_day + timedelta(days=__search_window_days - 1)
+                                                    __start_dt = datetime.combine(__start_day, datetime.min.time())
+                                                    __end_dt = datetime.combine(__end_day, datetime.max.time()).replace(microsecond=0)
+
+                                                    __events = await epaad_client.get_events(
+                                                        calendar_id=__cal_id_int,
+                                                        from_dt=__start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                                                        until_dt=__end_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                                                    )
+
+                                                    __opening_hours = default_opening_hours()
+                                                    __all_slots = []
+                                                    __working_days_count = 0
+                                                    for __day_offset in range(__search_window_days):
+                                                        __day = __start_day + timedelta(days=__day_offset)
+                                                        if __opening_hours.windows_by_weekday.get(__day.weekday(), []):
+                                                            __working_days_count += 1
+
+                                                        __day_slots = compute_free_slots(
+                                                            events=__events or [],
+                                                            target_date=__day,
+                                                            opening_hours=__opening_hours,
+                                                            slot_minutes=15,
+                                                            time_of_day=__tod,
+                                                            now_dt=__now_dt,
+                                                        )
+                                                        __all_slots.extend(__day_slots)
+
+                                                    __recommendation = build_next_available_recommendation(
+                                                        slots=__all_slots,
+                                                        start_date=__start_day,
+                                                        search_window_days=__search_window_days,
+                                                        requested_time_of_day=__tod,
+                                                        searched_working_days_count=__working_days_count,
+                                                    )
+                                                    __recommendation["available_slots"] = [
+                                                        __s.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S")
+                                                        for __s in sorted(__all_slots)[:10]
+                                                    ]
+                                                    logger.info(
+                                                        f"[NEXT SLOT] calendar_id={__cal_id_int}, time_of_day={__tod}, "
+                                                        f"window={__search_window_days}d, slots={len(__all_slots)}"
+                                                    )
+                                                    _result = _json_dumps(__recommendation)
+                                                except ValueError:
+                                                    # Validation block (doctors not fetched / invalid ID / bad date)
+                                                    pass
+                                                except Exception as __e:
+                                                    logger.error(f"Error in get_next_available_slot: {__e}")
                                                     _result = _json_dumps({"error": str(__e)})
 
                                             elif _func_name == "book_appointment":

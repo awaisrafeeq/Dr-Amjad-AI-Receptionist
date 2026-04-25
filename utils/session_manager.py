@@ -100,7 +100,7 @@ class SessionManager:
             platform=platform,
             status=status
         )
-        
+
         # Store phonebook match on session so rtmt can inject it into OpenAI context
         if phonebook_match:
             session.phonebook_match = phonebook_match.to_dict()

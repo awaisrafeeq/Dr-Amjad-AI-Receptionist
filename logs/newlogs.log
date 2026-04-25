@@ -1,240 +1,134 @@
-026-04-08 19:48:03 - routers.acs_call_events_routes - INFO - [CALL] Incoming from: +14253863461
-2026-04-08 19:48:03 - utils.session_manager - INFO - [SESSION] Created: 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:48:04 - utils.azure_storage_logger - INFO - Successfully logged call metadata for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:48:04 - utils.azure_storage_logger - INFO - Successfully logged call history for phone number +14253863461
-2026-04-08 19:48:06 - routers.acs_call_events_routes - INFO - [CALL CONNECTED] session=8e7645be, call_connection_id=17004080-ed44-468e-b5ad-19e044686d45
-2026-04-08 19:48:07 - routers.acs_call_events_routes - INFO - [CALL CONNECTED] Verified session.call_connection_id=17004080-ed44-468e-b5ad-19e044686d45
-2026-04-08 19:48:07 - utils.rtmt - INFO - [GREETING] Sent
-2026-04-08 19:48:09 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:48:09 - utils.rtmt - INFO - [TRANSCRIPT] agent: MedCenter Volta, Sie sprechen mit Kaya, der digita...
-2026-04-08 19:48:12 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:48:14 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:48:15 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:48:15 - utils.rtmt - INFO - [TRANSCRIPT] customer: If you can exist....
-2026-04-08 19:48:16 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:48:16 - utils.rtmt - INFO - [TRANSCRIPT] agent: Sure, we can continue in English. Hello, you have ...
-2026-04-08 19:48:16 - utils.rtmt - INFO - [LANG] Explicit switch to English detected from agent
-2026-04-08 19:48:24 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:48:26 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:48:27 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:48:27 - utils.rtmt - INFO - [TRANSCRIPT] customer: I want to book an appointment....
-2026-04-08 19:48:28 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:48:28 - utils.rtmt - INFO - [TRANSCRIPT] agent: Of course, I can help with that. Could you tell me...
-2026-04-08 19:48:33 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:48:36 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:48:36 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:48:36 - utils.rtmt - INFO - [TRANSCRIPT] customer: I have headache....
-2026-04-08 19:48:38 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:48:38 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you. May I please have your first and last n...
-2026-04-08 19:48:43 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:48:47 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:48:47 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:48:47 - utils.rtmt - INFO - [TRANSCRIPT] customer: First name is test, last name is delete....
-2026-04-08 19:48:49 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:48:49 - utils.rtmt - INFO - [TRANSCRIPT] agent: Let me confirm I have that right—your first name i...
-2026-04-08 19:48:54 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:48:57 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:48:57 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:48:57 - utils.rtmt - INFO - [TRANSCRIPT] customer: No, my first name is Test....
-2026-04-08 19:48:59 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:48:59 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you for the correction. Could you please spe...
-2026-04-08 19:49:05 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:49:08 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:49:09 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:49:09 - utils.rtmt - INFO - [TRANSCRIPT] customer: B.E.S.T....
-2026-04-08 19:49:10 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:49:10 - utils.rtmt - INFO - [TRANSCRIPT] agent: Got it, your first name is Defty. And your last na...
-2026-04-08 19:49:15 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:49:20 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:49:21 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:49:21 - utils.rtmt - INFO - [TRANSCRIPT] customer: No, my first name is Test. T-E-S-T....
-2026-04-08 19:49:23 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:49:23 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you for clarifying. So your first name is De...
-2026-04-08 19:49:29 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:49:36 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:49:37 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:49:37 - utils.rtmt - INFO - [TRANSCRIPT] customer: No, no, my first name is T. E. S. T. Test. Test....
-2026-04-08 19:49:40 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:49:40 - utils.rtmt - INFO - [TRANSCRIPT] agent: I'm sorry for the confusion. I want to make sure I...
-2026-04-08 19:49:50 - utils.rtmt - INFO - [INACTIVITY] Monitor cancelled (call likely ended externally)
-2026-04-08 19:49:50 - utils.rtmt - INFO - [CLEANUP] Forward loop ended — ensuring ACS call is hung up. session=8e7645be-23ea-4b2e-b105-aab072c0dcda, call_end_requested=False
-2026-04-08 19:49:50 - utils.rtmt - INFO - [HANGUP:forward_loop_cleanup] Attempting ACS hangup for session=8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:49:50 - utils.rtmt - INFO - [HANGUP:forward_loop_cleanup] Sending hang_up for call_connection_id=17004080-ed4...
-2026-04-08 19:49:50 - utils.rtmt - INFO - [HANGUP:forward_loop_cleanup] SUCCESS — ACS hangup sent for session=8e7645be
-2026-04-08 19:49:50 - utils.rtmt - INFO - [WEBSOCKET] Closed (code=1006)
-2026-04-08 19:49:50 - routers.acs_call_events_routes - INFO - [WS CLEANUP] Session 8e7645be still active — cleaning up
-2026-04-08 19:49:50 - routers.acs_call_events_routes - INFO - [CALL DISCONNECTED] session=8e7645be, call_connection_id=17004080-ed44-468e-b5ad-19e044686d45, reason_code=540000, message=Call ended successfully by local PSTN caller.
-2026-04-08 19:49:50 - routers.acs_call_events_routes - INFO - [CALLBACK] Session 8e7645be cleanup already in progress — skipping
-2026-04-08 19:49:53 - utils.azure_storage_logger - INFO - Retrieved 17 transcriptions for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:49:54 - utils.session_manager - INFO - [EMAIL] To default
-2026-04-08 19:49:59 - routers.acs_call_events_routes - INFO - [CALL] Incoming from: +14253863461
-2026-04-08 19:49:59 - utils.session_manager - INFO - [SESSION] Created: 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:49:59 - utils.azure_storage_logger - INFO - Successfully logged call metadata for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:49:59 - utils.azure_storage_logger - INFO - Successfully logged call history for phone number +14253863461
-2026-04-08 19:50:00 - routers.acs_call_events_routes - INFO - [CALL CONNECTED] session=0fc4adf0, call_connection_id=04004080-ccd5-4b2b-91fd-28b1cad6507d
-2026-04-08 19:50:00 - routers.acs_call_events_routes - INFO - [CALL CONNECTED] Verified session.call_connection_id=04004080-ccd5-4b2b-91fd-28b1cad6507d
-2026-04-08 19:50:01 - utils.rtmt - INFO - [GREETING] Sent
-2026-04-08 19:50:03 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:50:03 - utils.rtmt - INFO - [TRANSCRIPT] agent: MedCenter Volta, Sie sprechen mit Kaya, der digita...
-2026-04-08 19:50:04 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:50:06 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:50:08 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:50:08 - utils.rtmt - INFO - [TRANSCRIPT] customer: He's been killing this....
-2026-04-08 19:50:08 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:50:08 - utils.rtmt - INFO - [TRANSCRIPT] agent: Of course. We can continue in English. How may I h...
-2026-04-08 19:50:12 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:50:12 - utils.email_service - INFO - Email sent successfully via ACS to awaisrafeeqi102@gmail.com
-2026-04-08 19:50:12 - utils.session_manager - INFO - [EMAIL] Sent for 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:50:13 - utils.azure_storage_logger - INFO - Successfully logged call metadata for session 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:50:13 - utils.azure_storage_logger - INFO - Successfully logged call history for phone number +14253863461
-2026-04-08 19:50:13 - utils.session_manager - INFO - [SESSION] Ended: 8e7645be-23ea-4b2e-b105-aab072c0dcda
-2026-04-08 19:50:14 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:50:15 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:50:15 - utils.rtmt - INFO - [TRANSCRIPT] customer: I want to book an appointment....
-2026-04-08 19:50:17 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:50:17 - utils.rtmt - INFO - [TRANSCRIPT] agent: Sure, I can help with that. What is the reason for...
-2026-04-08 19:50:20 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:50:22 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:50:23 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:50:23 - utils.rtmt - INFO - [TRANSCRIPT] customer: I have headache....
-2026-04-08 19:50:24 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:50:24 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you for letting me know. Could you please te...
-2026-04-08 19:50:30 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:50:34 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:50:34 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:50:34 - utils.rtmt - INFO - [TRANSCRIPT] customer: First name is test, last name is delete...
-2026-04-08 19:50:37 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:50:37 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you. I want to make sure I have that correct...
-2026-04-08 19:50:43 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:50:48 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:50:48 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:50:48 - utils.rtmt - INFO - [TRANSCRIPT] customer: No, my first name is Test. T-E-S-T....
-2026-04-08 19:50:50 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:50:50 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you for clarifying. Just to confirm, your fi...
-2026-04-08 19:50:57 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:50:59 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:51:01 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:51:01 - utils.rtmt - INFO - [TRANSCRIPT] agent: Got it. Thanks for confirming, Test Delete.
-
-Which...
-2026-04-08 19:51:06 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:51:06 - utils.rtmt - INFO - [TRANSCRIPT] customer: ముగిసింది...
-2026-04-08 19:51:08 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:51:10 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:51:10 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:51:10 - utils.rtmt - INFO - [TRANSCRIPT] customer: Dr. Amjad....
-2026-04-08 19:51:12 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:51:12 - utils.rtmt - INFO - [TRANSCRIPT] agent: One moment, please. I'll check which doctors are a...
-2026-04-08 19:51:12 - utils.rtmt - INFO - [FUNCTION CALL] OpenAI invoked: get_available_doctors (call_id=call_jGT33inFdays4esf, session=0fc4adf0-dc90-4d9a-aa5e-fd2004272139)
-2026-04-08 19:51:13 - utils.rtmt - INFO - [HOLDING] get_available_doctors
-2026-04-08 19:51:13 - utils.epaad_client - INFO - [EPAAD AUTH] Authenticating with https://mcv.epaad.ch/api/v1/authenticate
-2026-04-08 19:51:13 - utils.epaad_client - INFO - [EPAAD AUTH] Response status=200
-2026-04-08 19:51:13 - utils.epaad_client - INFO - [EPAAD AUTH] Token acquired successfully (expires in 3540s)
-2026-04-08 19:51:13 - utils.epaad_client - INFO - [EPAAD API REQUEST] GET https://mcv.epaad.ch/api/v1/onedoc/calendars
-2026-04-08 19:51:13 - utils.epaad_client - INFO - [EPAAD API REQUEST] params=None, body=None
-2026-04-08 19:51:13 - utils.epaad_client - INFO - [EPAAD API RESPONSE] status=200, data_type=list, keys=N/A
-2026-04-08 19:51:13 - utils.rtmt - INFO - [DOCTORS] Valid calendar IDs for session: {4, 5, 6, 10, 13}
-2026-04-08 19:51:13 - utils.rtmt - INFO - [FUNCTION RESULT] Sending output for get_available_doctors (call_id=call_jGT33inFdays4esf): [{"calendar_id": 4, "doctor_name": "Dr. Amjad Mallisho"}, {"calendar_id": 5, "doctor_name": "Dr. Elif Keser"}, {"calenda
-2026-04-08 19:51:16 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:51:16 - utils.rtmt - INFO - [TRANSCRIPT] agent: I see that Dr. Amjad Mallisho is available. Now, c...
-2026-04-08 19:51:25 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:51:28 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:51:29 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:51:29 - utils.rtmt - INFO - [TRANSCRIPT] customer: 20 April at any time....
-2026-04-08 19:51:31 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:51:31 - utils.rtmt - INFO - [TRANSCRIPT] agent: One moment, please, while I check the availability...
-2026-04-08 19:51:32 - utils.rtmt - INFO - [FUNCTION CALL] OpenAI invoked: get_available_slots (call_id=call_qj0sONQShdgaWfMO, session=0fc4adf0-dc90-4d9a-aa5e-fd2004272139)
-2026-04-08 19:51:32 - utils.rtmt - INFO - [HOLDING] get_available_slots
-2026-04-08 19:51:32 - utils.epaad_client - INFO - [EPAAD API REQUEST] GET https://mcv.epaad.ch/api/v1/onedoc/calendars/4/events
-2026-04-08 19:51:32 - utils.epaad_client - INFO - [EPAAD API REQUEST] params={'fromDateTime': '2026-04-20T00:00:00', 'untilDateTime': '2026-04-20T23:59:59'}, body=None
-2026-04-08 19:51:32 - utils.epaad_client - INFO - [EPAAD API RESPONSE] status=200, data_type=list, keys=N/A
-2026-04-08 19:51:32 - utils.rtmt - INFO - [FUNCTION RESULT] Sending output for get_available_slots (call_id=call_qj0sONQShdgaWfMO): {"available_slots": ["2026-04-20T09:45:00", "2026-04-20T10:15:00", "2026-04-20T10:30:00", "2026-04-20T10:45:00"]}
-2026-04-08 19:51:35 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:51:35 - utils.rtmt - INFO - [TRANSCRIPT] agent: For April 20th, Dr. Amjad Mallisho has openings at...
-2026-04-08 19:51:42 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:51:45 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:51:45 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:51:45 - utils.rtmt - INFO - [TRANSCRIPT] customer: 10.15 a.m....
-2026-04-08 19:51:49 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:51:49 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you. I'll book the 10:15 am slot for you. Be...
-2026-04-08 19:52:01 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:52:04 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:52:05 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:52:05 - utils.rtmt - INFO - [TRANSCRIPT] customer: 1st January 2000...
-2026-04-08 19:52:07 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:52:07 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you. Could you let me know your street name ...
-2026-04-08 19:52:13 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:52:15 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:52:16 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:52:16 - utils.rtmt - INFO - [TRANSCRIPT] customer: Bird name is Beth....
-2026-04-08 19:52:18 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:52:18 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thanks. And what is the house number?...
-2026-04-08 19:52:21 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:52:22 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:52:23 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:52:23 - utils.rtmt - INFO - [TRANSCRIPT] customer: 22...
-2026-04-08 19:52:26 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:52:26 - utils.rtmt - INFO - [TRANSCRIPT] agent: Got it. Could you also provide your zip code, plea...
-2026-04-08 19:52:29 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:52:32 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:52:32 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:52:32 - utils.rtmt - INFO - [TRANSCRIPT] customer: 4 4 0 0 0...
-2026-04-08 19:52:33 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:52:33 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you. And which city do you live in?...
-2026-04-08 19:52:37 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:52:39 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:52:39 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:52:39 - utils.rtmt - INFO - [TRANSCRIPT] customer: اسلام عليكم...
-2026-04-08 19:52:43 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:52:43 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you. Lastly, could you provide your email ad...
-2026-04-08 19:52:47 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:52:50 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:52:51 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:52:51 - utils.rtmt - INFO - [TRANSCRIPT] customer: www.testedgmail.com...
-2026-04-08 19:52:53 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:52:53 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you. I'll book the appointment now for April...
-2026-04-08 19:52:55 - utils.rtmt - INFO - [FUNCTION CALL] OpenAI invoked: book_appointment (call_id=call_cjVZiXXMom5wkeIU, session=0fc4adf0-dc90-4d9a-aa5e-fd2004272139)
-2026-04-08 19:52:55 - utils.rtmt - INFO - [HOLDING] book_appointment
-2026-04-08 19:52:55 - utils.rtmt - INFO - [BOOKING] Type 61 (15 min)
-2026-04-08 19:52:55 - utils.epaad_client - INFO - [EPAAD API REQUEST] POST https://mcv.epaad.ch/api/v1/onedoc/calendars/4/events
-2026-04-08 19:52:55 - utils.epaad_client - INFO - [EPAAD API REQUEST] params=None, body={"startDateTime": "2026-04-20T10:15:00", "epaad_appointmenttype_id": 61, "comment": "headache", "patient": {"firstName": "Test", "lastName": "Delete", "birthDate": "2000-01-01T00:00:00", "gender": "other", "address": {"street": "Test", "streetNumber": "22", "zipCode": "44000", "city": "Islamabad", "state": "", "country": "CH"}, "privatePhoneNumber": "+14253863461", "mobilePhoneNumber": "+14253863461", "email": "test@gmail.com"}}
-2026-04-08 19:52:56 - utils.epaad_client - INFO - [EPAAD API RESPONSE] status=201, body={'message': 'appointment request created', 'onedoc_key': '79b2f97e-6731-4d1f-910a-c945bdf6a66a'}
-2026-04-08 19:52:56 - utils.rtmt - INFO - [BOOKING SUCCESS] 2026-04-20 ref:79b2f97e...
-2026-04-08 19:52:56 - utils.rtmt - INFO - [PHONEBOOK] Built patient_data: {'first_name': 'Test', 'last_name': 'Delete', 'birth_date': '01/01/2000', 'phone': '+14253863461', 'mobile': '+14253863461', 'gender': '', 'email': 'test@gmail.com', 'zip_code': '44000', 'city': 'Islamabad', 'address': 'Test 22', 'doctor': '', 'comment': 'AI Booking', 'language': 'Englisch'}
-2026-04-08 19:52:56 - utils.rtmt - INFO - [PHONEBOOK] New patient — adding entry for Test Delete
-2026-04-08 19:52:56 - utils.phonebook_lookup - INFO - [PHONEBOOK] Attempting to add new patient to /tmp/medcentervolta_phonebook_cache/phonebook_5fa2918ab6da6b8f.xlsx with data: {'first_name': 'Test', 'last_name': 'Delete', 'birth_date': '01/01/2000', 'phone': '+14253863461', 'mobile': '+14253863461', 'gender': '', 'email': 'test@gmail.com', 'zip_code': '44000', 'city': 'Islamabad', 'address': 'Test 22', 'doctor': 'Dr. Amjad Mallisho', 'comment': 'AI Booking', 'language': 'Englisch'}
-2026-04-08 19:52:56 - utils.rtmt - INFO - [FUNCTION RESULT] Sending output for book_appointment (call_id=call_cjVZiXXMom5wkeIU): {"status": "success", "booking_reference": "79b2f97e-6731-4d1f-910a-c945bdf6a66a", "instruction": "DO NOT speak the book
-2026-04-08 19:52:59 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:52:59 - utils.rtmt - INFO - [TRANSCRIPT] agent: Your appointment is booked for April 20th at 10:15...
-2026-04-08 19:53:08 - utils.rtmt - INFO - [BARGE-IN] Cancelled
-2026-04-08 19:53:10 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
-2026-04-08 19:53:11 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:53:11 - utils.rtmt - INFO - [TRANSCRIPT] customer: No, thank you....
-2026-04-08 19:53:13 - utils.phonebook_lookup - INFO - [PHONEBOOK] Mapping data to excel columns: {'Nachname': 'Delete', 'Vorname': 'Test', 'Geburtsdatum': '01/01/2000', 'Geschlecht': '', 'Sprache': 'Englisch', 'PLZ': '44000', 'Ort': 'Islamabad', 'Adresse': 'Test 22', 'Telefon': '+14253863461', 'Mobile-Nr.': '+14253863461', 'Email': 'test@gmail.com', 'Arzt': 'Dr. Amjad Mallisho', 'Notiz': 'AI Booking'}
-2026-04-08 19:53:13 - utils.azure_storage_logger - INFO - Successfully logged transcription for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:53:13 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you for calling MedCenter Volta. Goodbye....
-2026-04-08 19:53:15 - utils.rtmt - INFO - [FUNCTION CALL] OpenAI invoked: terminate_call (call_id=call_EjEJin6b5YiEkkTY, session=0fc4adf0-dc90-4d9a-aa5e-fd2004272139)
-2026-04-08 19:53:15 - utils.rtmt - INFO - [CALL END] AI requested terminate_call — session=0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:53:15 - utils.rtmt - INFO - [CALL END] Session state: call_connection_id=04004080-ccd5-4b2b-91fd-28b1cad6507d, status=active, event_count=4, server_call_id=aHR0cHM6Ly9hcGkuZmxpZ2h0cHJveHkuc2t5cGUuY29tL2FwaS92Mi9jcC9jb252LWZyY2UtMDEtcHJvZC1ha3MuY29udi5za3lwZS5jb20vY29udi9yTExUSDk5MzVFZXFLV256UTZlTEFBP2k9MTAtMTI4LTc0LTc4JmU9NjM5MTEyMDAxNDU1MTczODM3
-2026-04-08 19:53:15 - utils.rtmt - INFO - [CALL END] Waiting 4s for goodbye audio to finish...
-2026-04-08 19:53:19 - utils.rtmt - INFO - [HANGUP:terminate_call] Attempting ACS hangup for session=0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:53:19 - utils.rtmt - INFO - [HANGUP:terminate_call] Sending hang_up for call_connection_id=04004080-ccd...
-2026-04-08 19:53:19 - utils.rtmt - INFO - [HANGUP:terminate_call] SUCCESS — ACS hangup sent for session=0fc4adf0
-2026-04-08 19:53:19 - utils.rtmt - INFO - [FUNCTION RESULT] Sending output for terminate_call (call_id=call_EjEJin6b5YiEkkTY): {"status": "success", "message": "Terminating call now."}
-2026-04-08 19:53:19 - utils.rtmt - INFO - [FUNCTION RESULT] Skipping response.create — call_end_requested is set (func=terminate_call)
-2026-04-08 19:53:20 - utils.rtmt - INFO - [CLEANUP] Forward loop ended — ensuring ACS call is hung up. session=0fc4adf0-dc90-4d9a-aa5e-fd2004272139, call_end_requested=True
-2026-04-08 19:53:20 - utils.rtmt - INFO - [HANGUP:forward_loop_cleanup] Skipping — hangup already sent for session=0fc4adf0
-2026-04-08 19:53:20 - utils.rtmt - INFO - [WEBSOCKET] Closed (code=1006)
-2026-04-08 19:53:20 - routers.acs_call_events_routes - INFO - [WS CLEANUP] Session 0fc4adf0 still active — cleaning up
-2026-04-08 19:53:20 - routers.acs_call_events_routes - INFO - [CALL DISCONNECTED] session=0fc4adf0, call_connection_id=04004080-ccd5-4b2b-91fd-28b1cad6507d, reason_code=7000, message=Call was ended by Azure Communication Service Call Automation API or a server bot. DiagCode: 0#7000.@
-2026-04-08 19:53:20 - routers.acs_call_events_routes - INFO - [CALLBACK] Session 0fc4adf0 cleanup already in progress — skipping
-2026-04-08 19:53:23 - utils.azure_storage_logger - INFO - Retrieved 36 transcriptions for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:53:23 - utils.session_manager - INFO - [EMAIL] To default
-2026-04-08 19:53:29 - utils.phonebook_lookup - INFO - [PHONEBOOK] Successfully appended and saved new patient to /tmp/medcentervolta_phonebook_cache/phonebook_5fa2918ab6da6b8f.xlsx
-2026-04-08 19:53:29 - utils.phonebook_lookup - INFO - [PHONEBOOK] Blob upload succeeded after add_patient
-2026-04-08 19:53:32 - utils.email_service - INFO - Email sent successfully via ACS to awaisrafeeqi102@gmail.com
-2026-04-08 19:53:32 - utils.session_manager - INFO - [EMAIL] Sent for 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:53:33 - utils.azure_storage_logger - INFO - Successfully logged call metadata for session 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:53:33 - utils.azure_storage_logger - INFO - Successfully logged call history for phone number +14253863461
-2026-04-08 19:53:33 - utils.session_manager - INFO - [SESSION] Ended: 0fc4adf0-dc90-4d9a-aa5e-fd2004272139
-2026-04-08 19:53:49 - utils.phonebook_lookup - INFO - [PHONEBOOK] Successfully reloaded internal phonebook index.
+2026-04-23T14:26:33.9377919Z 2026-04-23 14:26:33 - routers.acs_call_events_routes - INFO - [CALL] Incoming from: +14253863461
+2026-04-23T14:26:33.9437148Z 2026-04-23 14:26:33 - utils.session_manager - INFO - [SESSION] Created: b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:26:34.8710081Z 2026-04-23 14:26:34 - utils.azure_storage_logger - INFO - Successfully logged call metadata for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:26:35.6186282Z 2026-04-23 14:26:35 - utils.azure_storage_logger - INFO - Successfully logged call history for phone number +14253863461
+2026-04-23T14:26:35.8320490Z INFO:     169.254.130.1:38337 - "POST /acs/incoming HTTP/1.1" 200 OK
+2026-04-23T14:26:37.0112227Z 2026-04-23 14:26:37 - routers.acs_call_events_routes - INFO - [CALL CONNECTED] session=b12c9d50, call_connection_id=22004180-6f22-4ad1-9ddb-756da504ee5b
+2026-04-23T14:26:37.1796875Z INFO:     169.254.130.1:38359 - "WebSocket /realtime-acs?session_id=b12c9d50-da65-428e-93cf-9f94dafa67b0" [accepted]
+2026-04-23T14:26:37.1797255Z INFO:     connection open
+2026-04-23T14:26:37.2293545Z 2026-04-23 14:26:37 - routers.acs_call_events_routes - INFO - [CALL CONNECTED] Verified session.call_connection_id=22004180-6f22-4ad1-9ddb-756da504ee5b
+2026-04-23T14:26:37.2322640Z INFO:     169.254.130.1:38337 - "POST /acs/callbacks/b12c9d50-da65-428e-93cf-9f94dafa67b0?callerId=%2B14253863461 HTTP/1.1" 200 OK
+2026-04-23T14:26:37.2889749Z INFO:     169.254.130.1:38349 - "POST /acs/callbacks/b12c9d50-da65-428e-93cf-9f94dafa67b0?callerId=%2B14253863461 HTTP/1.1" 200 OK
+2026-04-23T14:26:37.4191858Z INFO:     169.254.130.1:38337 - "POST /acs/callbacks/b12c9d50-da65-428e-93cf-9f94dafa67b0?callerId=%2B14253863461 HTTP/1.1" 200 OK
+2026-04-23T14:26:37.5658902Z 2026-04-23 14:26:37 - utils.rtmt - INFO - [PHONEBOOK] Injected match for Test Deleet into OpenAI session
+2026-04-23T14:26:37.5685104Z 2026-04-23 14:26:37 - utils.rtmt - INFO - [PHONEBOOK DEBUG] birth_date=01/01/2000, email=test@gmail.com, address=Test 22, zip=4000, city=Lahore, phone=+41PHONE
+2026-04-23T14:26:37.5709846Z 2026-04-23 14:26:37 - utils.rtmt - INFO - [GREETING] Sent
+2026-04-23T14:26:39.5581507Z 2026-04-23 14:26:39 - utils.rtmt - INFO - [TRANSCRIPT] agent: MedCenter Volta, Sie sprechen mit Kaya, der digita...
+2026-04-23T14:26:40.1963479Z 2026-04-23 14:26:40 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:26:42.3838829Z 2026-04-23 14:26:42 - utils.rtmt - INFO - [BARGE-IN] Cancelled
+2026-04-23T14:26:44.4838354Z 2026-04-23 14:26:44 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
+2026-04-23T14:26:45.1622959Z 2026-04-23 14:26:45 - utils.rtmt - INFO - [TRANSCRIPT] customer: Speak in English....
+2026-04-23T14:26:45.1660241Z 2026-04-23 14:26:45 - utils.rtmt - INFO - [LANG] Explicit switch to English detected from customer
+2026-04-23T14:26:45.3620283Z 2026-04-23 14:26:45 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:26:47.4974993Z 2026-04-23 14:26:47 - utils.rtmt - INFO - [TRANSCRIPT] agent: NatÃ¼rlich, wir kÃ¶nnen gerne auf Englisch sprechen....
+2026-04-23T14:26:47.6517544Z 2026-04-23 14:26:47 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:26:55.7221363Z 2026-04-23 14:26:55 - utils.rtmt - INFO - [BARGE-IN] Cancelled
+2026-04-23T14:26:58.8815962Z 2026-04-23 14:26:58 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
+2026-04-23T14:26:59.3248688Z 2026-04-23 14:26:59 - utils.rtmt - INFO - [TRANSCRIPT] customer: I want the world to be a better place....
+2026-04-23T14:26:59.4819506Z 2026-04-23 14:26:59 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:27:00.5080407Z 2026-04-23 14:27:00 - utils.rtmt - INFO - [TRANSCRIPT] agent: Sure, I'd be happy to help with that. What is the ...
+2026-04-23T14:27:00.6523381Z 2026-04-23 14:27:00 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:27:05.1219771Z 2026-04-23 14:27:05 - utils.rtmt - INFO - [BARGE-IN] Cancelled
+2026-04-23T14:27:07.6099786Z 2026-04-23 14:27:07 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
+2026-04-23T14:27:08.0824777Z 2026-04-23 14:27:08 - utils.rtmt - INFO - [TRANSCRIPT] customer: I have had it....
+2026-04-23T14:27:08.2316695Z 2026-04-23 14:27:08 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:27:10.1181020Z 2026-04-23 14:27:10 - utils.rtmt - INFO - [TRANSCRIPT] agent: I'm sorry to hear that. To schedule the appointmen...
+2026-04-23T14:27:10.3181642Z 2026-04-23 14:27:10 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:27:16.8639674Z 2026-04-23 14:27:16 - utils.rtmt - INFO - [BARGE-IN] Cancelled
+2026-04-23T14:27:21.1125400Z 2026-04-23 14:27:21 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
+2026-04-23T14:27:21.6636315Z 2026-04-23 14:27:21 - utils.rtmt - INFO - [TRANSCRIPT] customer: My first name is Test and last name is Delete....
+2026-04-23T14:27:21.8208636Z 2026-04-23 14:27:21 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:27:23.2202510Z 2026-04-23 14:27:23 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you. Just to confirm, your first name is Tes...
+2026-04-23T14:27:23.3723759Z 2026-04-23 14:27:23 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:27:28.5258092Z 2026-04-23 14:27:28 - utils.rtmt - INFO - [BARGE-IN] Cancelled
+2026-04-23T14:27:30.1722014Z 2026-04-23 14:27:30 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
+2026-04-23T14:27:30.5606377Z 2026-04-23 14:27:30 - utils.rtmt - INFO - [TRANSCRIPT] customer: But they're...
+2026-04-23T14:27:30.7021288Z 2026-04-23 14:27:30 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:27:32.1708030Z 2026-04-23 14:27:32 - utils.rtmt - INFO - [TRANSCRIPT] agent: Great, thank you for confirming. Which doctor woul...
+2026-04-23T14:27:32.3328414Z 2026-04-23 14:27:32 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:27:37.6627336Z 2026-04-23 14:27:37 - utils.rtmt - INFO - [BARGE-IN] Cancelled
+2026-04-23T14:27:40.2428231Z 2026-04-23 14:27:40 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
+2026-04-23T14:27:40.7670066Z 2026-04-23 14:27:40 - utils.rtmt - INFO - [TRANSCRIPT] customer: Dr. Anganwaleesha....
+2026-04-23T14:27:40.9219777Z 2026-04-23 14:27:40 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:27:42.0588771Z 2026-04-23 14:27:42 - utils.rtmt - INFO - [TRANSCRIPT] agent: One moment, please. I'll check the available docto...
+2026-04-23T14:27:42.2790836Z 2026-04-23 14:27:42 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:27:42.6001101Z 2026-04-23 14:27:42 - utils.rtmt - INFO - [FUNCTION CALL] OpenAI invoked: get_available_doctors (call_id=call_N7YVRZTRaiBCn5be, session=b12c9d50-da65-428e-93cf-9f94dafa67b0)
+2026-04-23T14:27:42.6298213Z 2026-04-23 14:27:42 - utils.rtmt - INFO - [HOLDING] get_available_doctors
+2026-04-23T14:27:42.6316659Z 2026-04-23 14:27:42 - utils.epaad_client - INFO - [EPAAD AUTH] Authenticating with https://mcv.epaad.ch/api/v1/authenticate
+2026-04-23T14:27:42.7764668Z 2026-04-23 14:27:42 - utils.epaad_client - INFO - [EPAAD AUTH] Response status=200
+2026-04-23T14:27:42.7794413Z 2026-04-23 14:27:42 - utils.epaad_client - INFO - [EPAAD AUTH] Token acquired successfully (expires in 3540s)
+2026-04-23T14:27:42.7813467Z 2026-04-23 14:27:42 - utils.epaad_client - INFO - [EPAAD API REQUEST] GET https://mcv.epaad.ch/api/v1/onedoc/calendars
+2026-04-23T14:27:42.7831379Z 2026-04-23 14:27:42 - utils.epaad_client - INFO - [EPAAD API REQUEST] params=None, body=None
+2026-04-23T14:27:42.8079374Z 2026-04-23 14:27:42 - utils.epaad_client - INFO - [EPAAD API RESPONSE] status=200, data_type=list, keys=N/A
+2026-04-23T14:27:42.8162217Z 2026-04-23 14:27:42 - utils.rtmt - INFO - [DOCTORS] Valid calendar IDs for session: {4, 5, 6, 10, 13}
+2026-04-23T14:27:42.8637129Z 2026-04-23 14:27:42 - utils.rtmt - INFO - [FUNCTION RESULT] Sending output for get_available_doctors (call_id=call_N7YVRZTRaiBCn5be): [{"calendar_id":4,"doctor_name":"Dr. Amjad Mallisho"},{"calendar_id":5,"doctor_name":"Dr. Elif Keser"},{"calendar_id":10
+2026-04-23T14:27:46.1253646Z 2026-04-23 14:27:46 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you for waiting. Now, do you have a specific...
+2026-04-23T14:27:46.2722503Z 2026-04-23 14:27:46 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:27:50.0418501Z 2026-04-23 14:27:50 - utils.rtmt - INFO - [BARGE-IN] Cancelled
+2026-04-23T14:27:55.7744457Z 2026-04-23 14:27:55 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
+2026-04-23T14:27:56.3308976Z 2026-04-23 14:27:56 - utils.rtmt - INFO - [TRANSCRIPT] customer: I want the earliest date and earliest appointment....
+2026-04-23T14:27:56.4831910Z 2026-04-23 14:27:56 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:27:58.1590293Z 2026-04-23 14:27:58 - utils.rtmt - INFO - [TRANSCRIPT] agent: Sure, one moment please while I check the earliest...
+2026-04-23T14:27:58.3126447Z 2026-04-23 14:27:58 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:27:59.3498969Z 2026-04-23 14:27:59 - utils.rtmt - INFO - [FUNCTION CALL] OpenAI invoked: get_next_available_slot (call_id=call_nNRyCmjD0JkCkskZ, session=b12c9d50-da65-428e-93cf-9f94dafa67b0)
+2026-04-23T14:27:59.3537659Z 2026-04-23 14:27:59 - utils.epaad_client - INFO - [EPAAD API REQUEST] GET https://mcv.epaad.ch/api/v1/onedoc/calendars/4/events
+2026-04-23T14:27:59.3555870Z 2026-04-23 14:27:59 - utils.epaad_client - INFO - [EPAAD API REQUEST] params={'fromDateTime': '2026-04-23T00:00:00', 'untilDateTime': '2026-05-06T23:59:59'}, body=None
+2026-04-23T14:27:59.5022621Z 2026-04-23 14:27:59 - utils.epaad_client - INFO - [EPAAD API RESPONSE] status=200, data_type=list, keys=N/A
+2026-04-23T14:27:59.5077714Z 2026-04-23 14:27:59 - utils.rtmt - INFO - [NEXT SLOT] calendar_id=4, time_of_day=any, window=14d, slots=21
+2026-04-23T14:27:59.5163280Z 2026-04-23 14:27:59 - utils.rtmt - INFO - [FUNCTION RESULT] Sending output for get_next_available_slot (call_id=call_nNRyCmjD0JkCkskZ): {"status":"success","requested_time_of_day":"any","searched_from":"2026-04-23","searched_until":"2026-05-06","search_win
+2026-04-23T14:28:02.1263719Z 2026-04-23 14:28:02 - utils.rtmt - INFO - [TRANSCRIPT] agent: The earliest available appointment with Dr. Amjad ...
+2026-04-23T14:28:02.3356604Z 2026-04-23 14:28:02 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:28:11.6310422Z 2026-04-23 14:28:11 - utils.rtmt - INFO - [BARGE-IN] Cancelled
+2026-04-23T14:28:14.4558106Z 2026-04-23 14:28:14 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
+2026-04-23T14:28:14.8980601Z 2026-04-23 14:28:14 - utils.rtmt - INFO - [TRANSCRIPT] customer: a bit later...
+2026-04-23T14:28:15.0433961Z 2026-04-23 14:28:15 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:28:17.3589494Z 2026-04-23 14:28:17 - utils.rtmt - INFO - [TRANSCRIPT] agent: No problem. An alternative that same day is April ...
+2026-04-23T14:28:17.5130724Z 2026-04-23 14:28:17 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:28:23.8066398Z 2026-04-23 14:28:23 - utils.rtmt - INFO - [BARGE-IN] Cancelled
+2026-04-23T14:28:25.8749712Z 2026-04-23 14:28:25 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
+2026-04-23T14:28:26.3359819Z 2026-04-23 14:28:26 - utils.rtmt - INFO - [TRANSCRIPT] customer: It would be better....
+2026-04-23T14:28:26.4836274Z 2026-04-23 14:28:26 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:28:28.6280980Z 2026-04-23 14:28:28 - utils.rtmt - INFO - [TRANSCRIPT] agent: Great, we'll go with April 27th at 1:30 PM. I'll g...
+2026-04-23T14:28:28.7837543Z 2026-04-23 14:28:28 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:28:30.1221335Z 2026-04-23 14:28:30 - utils.rtmt - INFO - [FUNCTION CALL] OpenAI invoked: book_appointment (call_id=call_m9dJzDrq4J1svZXi, session=b12c9d50-da65-428e-93cf-9f94dafa67b0)
+2026-04-23T14:28:30.1258176Z 2026-04-23 14:28:30 - utils.rtmt - INFO - [BOOKING] Type 61 (15 min)
+2026-04-23T14:28:30.1276635Z 2026-04-23 14:28:30 - utils.epaad_client - INFO - [EPAAD API REQUEST] POST https://mcv.epaad.ch/api/v1/onedoc/calendars/4/events
+2026-04-23T14:28:30.1293312Z 2026-04-23 14:28:30 - utils.epaad_client - INFO - [EPAAD API REQUEST] params=None, body={"startDateTime": "2026-04-27T13:30:00", "epaad_appointmenttype_id": 61, "comment": "headache", "patient": {"firstName": "Test", "lastName": "Deleet", "birthDate": "2000-01-01T00:00:00", "gender": "male", "address": {"street": "Test", "streetNumber": "22", "zipCode": "4000", "city": "Lahore", "state": "", "country": "CH"}, "privatePhoneNumber": "+41PHONE", "mobilePhoneNumber": "+41PHONE", "email": "test@gmail.com"}}
+2026-04-23T14:28:30.5627060Z 2026-04-23 14:28:30 - utils.epaad_client - INFO - [EPAAD API RESPONSE] status=201, body={'message': 'appointment request created', 'onedoc_key': '9d7d70a6-ae19-4547-98cf-be60b5692135'}
+2026-04-23T14:28:30.5647539Z 2026-04-23 14:28:30 - utils.rtmt - INFO - [BOOKING SUCCESS] 2026-04-27 ref:9d7d70a6...
+2026-04-23T14:28:30.5665751Z 2026-04-23 14:28:30 - utils.rtmt - INFO - [FUNCTION RESULT] Sending output for book_appointment (call_id=call_m9dJzDrq4J1svZXi): {"status":"success","booking_reference":"9d7d70a6-ae19-4547-98cf-be60b5692135","instruction":"DO NOT speak the booking_r
+2026-04-23T14:28:30.5692120Z 2026-04-23 14:28:30 - utils.rtmt - INFO - [PHONEBOOK] Built patient_data: {'first_name': 'Test', 'last_name': 'Deleet', 'birth_date': '01/01/2000', 'phone': '+41PHONE', 'mobile': '+14253863461', 'gender': 'M', 'email': 'test@gmail.com', 'zip_code': '4000', 'city': 'Lahore', 'address': 'Test 22', 'doctor': '', 'comment': 'AI Booking', 'language': 'Englisch'}
+2026-04-23T14:28:30.5736367Z 2026-04-23 14:28:30 - utils.rtmt - INFO - [PHONEBOOK] Patient already exists â€” skipping for Test Deleet
+2026-04-23T14:28:33.5749750Z 2026-04-23 14:28:33 - utils.rtmt - INFO - [TRANSCRIPT] agent: Your appointment has been booked for April 27th at...
+2026-04-23T14:28:33.7229291Z 2026-04-23 14:28:33 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:28:41.5567030Z 2026-04-23 14:28:41 - utils.rtmt - INFO - [BARGE-IN] Cancelled
+2026-04-23T14:28:43.5844919Z 2026-04-23 14:28:43 - utils.rtmt - INFO - [TURN] Speech stopped, wait 0.3s
+2026-04-23T14:28:44.0206780Z 2026-04-23 14:28:44 - utils.rtmt - INFO - [TRANSCRIPT] customer: No, thank you....
+2026-04-23T14:28:44.1638569Z 2026-04-23 14:28:44 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:28:46.2842706Z 2026-04-23 14:28:46 - utils.rtmt - INFO - [TRANSCRIPT] agent: Thank you for calling MedCenter Volta. Goodbye....
+2026-04-23T14:28:46.4430845Z 2026-04-23 14:28:46 - utils.azure_storage_logger - INFO - Successfully logged transcription for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:28:47.7263929Z 2026-04-23 14:28:47 - utils.rtmt - INFO - [FUNCTION CALL] OpenAI invoked: terminate_call (call_id=call_VLeFe7GjAumRKQPZ, session=b12c9d50-da65-428e-93cf-9f94dafa67b0)
+2026-04-23T14:28:47.7298895Z 2026-04-23 14:28:47 - utils.rtmt - INFO - [CALL END] AI requested terminate_call â€” session=b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:28:47.7325675Z 2026-04-23 14:28:47 - utils.rtmt - INFO - [CALL END] Session state: call_connection_id=22004180-6f22-4ad1-9ddb-756da504ee5b, status=active, event_count=4, server_call_id=aHR0cHM6Ly9hcGkuZmxpZ2h0cHJveHkuc2t5cGUuY29tL2FwaS92Mi9jcC9jb252LXN3Y2UtMDItcHJvZC1ha3MuY29udi5za3lwZS5jb20vY29udi9JT19hUG9VVXVFMmxnSmVReWhDVy1nP2k9MTAtMTI4LTYyLTIxMyZlPTYzOTEyMzk5NzM3ODA5MTM1MQ==
+2026-04-23T14:28:47.7342393Z 2026-04-23 14:28:47 - utils.rtmt - INFO - [CALL END] Waiting 1.5s for goodbye audio to finish...
+2026-04-23T14:28:49.2370728Z 2026-04-23 14:28:49 - utils.rtmt - INFO - [HANGUP:terminate_call] Attempting ACS hangup for session=b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:28:49.2398633Z 2026-04-23 14:28:49 - utils.rtmt - INFO - [HANGUP:terminate_call] Sending hang_up for call_connection_id=22004180-6f2...
+2026-04-23T14:28:49.4143750Z 2026-04-23 14:28:49 - utils.rtmt - INFO - [HANGUP:terminate_call] SUCCESS â€” ACS hangup sent for session=b12c9d50
+2026-04-23T14:28:49.4165834Z 2026-04-23 14:28:49 - utils.rtmt - INFO - [FUNCTION RESULT] Sending output for terminate_call (call_id=call_VLeFe7GjAumRKQPZ): {"status":"success","message":"Terminating call now."}
+2026-04-23T14:28:49.4185060Z 2026-04-23 14:28:49 - utils.rtmt - INFO - [FUNCTION RESULT] Skipping response.create â€” call_end_requested is set (func=terminate_call)
+2026-04-23T14:28:49.4251068Z INFO:     connection closed
+2026-04-23T14:28:49.4264206Z 2026-04-23 14:28:49 - utils.rtmt - INFO - [CLEANUP] Forward loop ended â€” ensuring ACS call is hung up. session=b12c9d50-da65-428e-93cf-9f94dafa67b0, call_end_requested=True
+2026-04-23T14:28:49.4314959Z 2026-04-23 14:28:49 - utils.rtmt - INFO - [HANGUP:forward_loop_cleanup] Skipping â€” hangup already sent for session=b12c9d50
+2026-04-23T14:28:49.4336113Z 2026-04-23 14:28:49 - utils.rtmt - INFO - [WEBSOCKET] Closed (code=1006)
+2026-04-23T14:28:49.4404528Z 2026-04-23 14:28:49 - routers.acs_call_events_routes - INFO - [WS CLEANUP] Session b12c9d50 still active â€” cleaning up
+2026-04-23T14:28:49.5309385Z 2026-04-23 14:28:49 - routers.acs_call_events_routes - INFO - [CALL DISCONNECTED] session=b12c9d50, call_connection_id=22004180-6f22-4ad1-9ddb-756da504ee5b, reason_code=7000, message=Call was ended by Azure Communication Service Call Automation API or a server bot. DiagCode: 0#7000.@
+2026-04-23T14:28:49.5328886Z 2026-04-23 14:28:49 - routers.acs_call_events_routes - INFO - [CALLBACK] Session b12c9d50 cleanup already in progress â€” skipping
+2026-04-23T14:28:49.5346527Z INFO:     169.254.130.1:65111 - "POST /acs/callbacks/b12c9d50-da65-428e-93cf-9f94dafa67b0?callerId=%2B14253863461 HTTP/1.1" 200 OK
+2026-04-23T14:28:49.6224553Z INFO:     169.254.130.1:65105 - "POST /acs/callbacks/b12c9d50-da65-428e-93cf-9f94dafa67b0?callerId=%2B14253863461 HTTP/1.1" 200 OK
+2026-04-23T14:28:52.6066999Z 2026-04-23 14:28:52 - utils.azure_storage_logger - INFO - Retrieved 24 transcriptions for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:28:52.6094200Z 2026-04-23 14:28:52 - utils.session_manager - INFO - [EMAIL] To default
+2026-04-23T14:29:02.0022840Z 2026-04-23 14:29:02 - utils.email_service - INFO - Email sent successfully via ACS to awaisrafeeqi102@gmail.com
+2026-04-23T14:29:02.0057486Z 2026-04-23 14:29:02 - utils.session_manager - INFO - [EMAIL] Sent for b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:29:02.4015521Z 2026-04-23 14:29:02 - utils.azure_storage_logger - INFO - Successfully logged call metadata for session b12c9d50-da65-428e-93cf-9f94dafa67b0
+2026-04-23T14:29:02.5854713Z 2026-04-23 14:29:02 - utils.azure_storage_logger - INFO - Successfully logged call history for phone number +14253863461
+2026-04-23T14:29:02.5873629Z 2026-04-23 14:29:02 - utils.session_manager - INFO - [SESSION] Ended: b12c9d50-da65-428e-93cf-9f94dafa67b0

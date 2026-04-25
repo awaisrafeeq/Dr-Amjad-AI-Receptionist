@@ -37,6 +37,28 @@ class SlotRecommendation:
     remaining_options_count: int
 
 
+@dataclass
+class NextAvailableOffer:
+    startDateTime: str
+    day: str
+    label: str
+    window: TimeOfDay
+
+
+@dataclass
+class NextAvailableRecommendation:
+    status: str
+    requested_time_of_day: TimeOfDay
+    searched_from: str
+    searched_until: str
+    search_window_days: int
+    searched_working_days_count: int
+    available_slots_count: int
+    primary_offer: Optional[NextAvailableOffer]
+    alternative_offer: Optional[NextAvailableOffer]
+    message: Optional[str] = None
+
+
 DEFAULT_TZ = os.getenv("EPAAD_TIMEZONE", "Europe/Zurich")
 DEFAULT_SLOT_MINUTES = int(os.getenv("EPAAD_SLOT_MINUTES", "15"))
 
@@ -245,6 +267,15 @@ def _format_offer(slot: datetime) -> SlotOffer:
     )
 
 
+def _format_next_available_offer(slot: datetime) -> NextAvailableOffer:
+    return NextAvailableOffer(
+        startDateTime=slot.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S"),
+        day=slot.date().isoformat(),
+        label=slot.strftime("%Y-%m-%d %H:%M"),
+        window=_window_for_slot(slot),
+    )
+
+
 def _rank_slots(slots: List[datetime], requested_time_of_day: TimeOfDay) -> List[datetime]:
     if not slots:
         return []
@@ -315,5 +346,34 @@ def build_slot_recommendation(
         primary_offer=primary_offer,
         alternative_offer=alternative_offer,
         remaining_options_count=max(0, len(ranked) - (1 if primary_offer else 0) - (1 if alternative_offer else 0)),
+    )
+    return asdict(recommendation)
+
+
+def build_next_available_recommendation(
+    *,
+    slots: List[datetime],
+    start_date: date,
+    search_window_days: int,
+    requested_time_of_day: TimeOfDay,
+    searched_working_days_count: int,
+) -> Dict[str, object]:
+    """Return the earliest available appointment over a multi-day search window."""
+
+    search_window_days = max(1, search_window_days)
+    searched_until = start_date + timedelta(days=search_window_days - 1)
+    ranked = sorted(slots)
+
+    recommendation = NextAvailableRecommendation(
+        status="success" if ranked else "no_slots_found",
+        requested_time_of_day=requested_time_of_day,
+        searched_from=start_date.isoformat(),
+        searched_until=searched_until.isoformat(),
+        search_window_days=search_window_days,
+        searched_working_days_count=searched_working_days_count,
+        available_slots_count=len(ranked),
+        primary_offer=_format_next_available_offer(ranked[0]) if ranked else None,
+        alternative_offer=_format_next_available_offer(ranked[1]) if len(ranked) > 1 else None,
+        message=None if ranked else f"No available appointments found in the next {search_window_days} days.",
     )
     return asdict(recommendation)
