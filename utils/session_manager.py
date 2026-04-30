@@ -7,11 +7,17 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 from uuid import uuid4
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from utils.azure_storage_logger import storage_logger
 from utils.phonebook_lookup import get_phonebook_lookup
 
 logger = logging.getLogger(__name__)
+
+
+def _phonebook_for_model(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not data:
+        return None
+    return {key: (value if value not in (None, "") else "MISSING") for key, value in data.items()}
 
 @dataclass
 class CallSession:
@@ -33,6 +39,7 @@ class CallSession:
     transcription_count: int = 0
     event_count: int = 0
     phonebook_match: Optional[Dict[str, Any]] = None
+    phonebook_candidates: List[Dict[str, Any]] = field(default_factory=list)
     insurance_card_number: Optional[str] = None
 
 class SessionManager:
@@ -65,11 +72,13 @@ class SessionManager:
         phone_number_caller = event["from"]["phoneNumber"]["value"]
         kind_caller = event["from"]["kind"]
 
-        phonebook_match = None
+        phonebook_candidates: List[Dict[str, Any]] = []
         try:
             lookup = get_phonebook_lookup()
             if lookup is not None:
-                phonebook_match = lookup.lookup_by_phone(phone_number_caller)
+                phonebook_candidates = [
+                    match.to_dict() for match in lookup.lookup_candidates_by_phone(phone_number_caller)
+                ]
         except Exception as e:
             logger.warning("Phonebook lookup failed (internal only): %s", e)
         
@@ -98,12 +107,9 @@ class SessionManager:
             ],
             direction=direction,
             platform=platform,
-            status=status
+            status=status,
+            phonebook_candidates=phonebook_candidates,
         )
-
-        # Store phonebook match on session so rtmt can inject it into OpenAI context
-        if phonebook_match:
-            session.phonebook_match = phonebook_match.to_dict()
 
         # Store in active sessions
         async with self._session_lock:
@@ -129,7 +135,7 @@ class SessionManager:
             ],
             'platform': platform,
             'status': status,
-            'internal_phonebook_match': phonebook_match.to_dict() if phonebook_match else None,
+            'internal_phonebook_candidate_count': len(phonebook_candidates),
         }
         
         phone_number = session.participants[0]['phone_number'] if session.participants else "unknown"
@@ -145,7 +151,7 @@ class SessionManager:
             await self.log_event(session_id, {
                 'event_type': event_type,
                 'timestamp': start_time.isoformat(),
-                'internal_phonebook_match': phonebook_match.to_dict() if phonebook_match else None,
+                'internal_phonebook_candidate_count': len(phonebook_candidates),
             })
             await storage_logger.log_call_history(session.history_id, phone_number, history_doc)
             
@@ -436,11 +442,50 @@ class SessionManager:
                 
             return {
                 "matched_caller": session.phonebook_match is not None,
-                "phonebook_info": session.phonebook_match
+                "candidate_count": len(session.phonebook_candidates or []),
+                "phonebook_info": _phonebook_for_model(session.phonebook_match),
             }
         except Exception as e:
             logger.error(f"[SESSION] Phonebook info error: {e}")
             return None
+
+    def resolve_phonebook_identity(self, session_id: str, first_name: Optional[str], last_name: Optional[str]) -> Dict[str, Any]:
+        session = self.active_sessions.get(session_id)
+        if not session:
+            return {"matched": False, "is_new_patient": False, "status": "error", "message": "Session not found."}
+
+        caller_phone = session.participants[0].get("phone_number") if session.participants else None
+        candidate_count = len(session.phonebook_candidates or [])
+        lookup = get_phonebook_lookup()
+
+        if not lookup or not caller_phone:
+            session.phonebook_match = None
+            return {
+                "matched": False,
+                "is_new_patient": True,
+                "status": "lookup_unavailable",
+                "candidate_count": candidate_count,
+            }
+
+        match = lookup.lookup_by_phone_and_name(caller_phone, first_name, last_name)
+        if match:
+            session.phonebook_match = match.to_dict()
+            return {
+                "matched": True,
+                "is_new_patient": False,
+                "status": "matched",
+                "candidate_count": candidate_count,
+                "phonebook_match": _phonebook_for_model(session.phonebook_match),
+            }
+
+        session.phonebook_match = None
+        return {
+            "matched": False,
+            "is_new_patient": True,
+            "status": "new_patient",
+            "candidate_count": candidate_count,
+            "message": "No existing patient matched all three fields: caller phone number, first name, and last name.",
+        }
 
     async def initialize(self):
         """Initialize the session manager and storage containers."""

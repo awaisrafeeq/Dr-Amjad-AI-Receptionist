@@ -174,6 +174,12 @@ class RTMiddleTier:
                             return orjson.dumps(obj).decode('utf-8')
                         return json.dumps(obj)
 
+                    def _resolved_phonebook_match() -> Optional[Dict[str, Any]]:
+                        if not session_id:
+                            return None
+                        _sess = session_manager.active_sessions.get(session_id)
+                        return _sess.phonebook_match if _sess else None
+
                     async def send_assistant_prompt(instructions: str) -> None:
                         nonlocal response_active
                         if response_active:
@@ -262,31 +268,30 @@ class RTMiddleTier:
                             greeting_sent.set()
                             return
 
-                        # --- INJECT PHONEBOOK MATCH INTO SESSION INSTRUCTIONS ---
-                        # If the caller was recognised in the internal phonebook, tell OpenAI
-                        # about it now so it can silently use their details during the call.
+                        # --- INJECT PHONEBOOK CANDIDATE INSTRUCTIONS ---
+                        # Phone number alone is only a candidate signal. The model must ask
+                        # for the caller's name and call resolve_phonebook_identity before
+                        # using any stored patient details.
                         try:
                             if session_id:
                                 _pb_sess = session_manager.active_sessions.get(session_id)
-                                _pb_match = _pb_sess.phonebook_match if _pb_sess else None
-                                if _pb_match:
+                                _pb_candidates = (_pb_sess.phonebook_candidates or []) if _pb_sess else []
+                                if _pb_candidates:
+                                    _candidate_names = []
+                                    for _idx, _candidate in enumerate(_pb_candidates[:5], start=1):
+                                        _candidate_names.append(
+                                            f"{_idx}. {_candidate.get('first_name') or 'MISSING'} {_candidate.get('last_name') or 'MISSING'}"
+                                        )
                                     _pb_lines = [
-                                        "[INTERNAL — PHONEBOOK DATA FOR THIS PHONE NUMBER]",
-                                        f"First name: {_pb_match.get('first_name') or 'MISSING'}",
-                                        f"Last name: {_pb_match.get('last_name') or 'MISSING'}",
-                                        f"Date of birth: {_pb_match.get('birth_date') or 'MISSING'}",
-                                        f"Phone: {_pb_match.get('phone') or 'MISSING'}",
-                                        f"Email: {_pb_match.get('email') or 'MISSING'}",
-                                        f"Doctor: {_pb_match.get('doctor') or 'MISSING'}",
-                                        f"Language: {_pb_match.get('language') or 'MISSING'}",
-                                        f"Gender: {_pb_match.get('gender') or 'MISSING'}",
-                                        f"Address: {_pb_match.get('address') or 'MISSING'}",
-                                        f"Zip: {_pb_match.get('zip_code') or 'MISSING'}",
-                                        f"City: {_pb_match.get('city') or 'MISSING'}",
+                                        "[INTERNAL — PHONEBOOK CANDIDATES FOR THIS PHONE NUMBER]",
+                                        f"Candidate count: {len(_pb_candidates)}",
+                                        "Candidate names:",
+                                        "\n".join(_candidate_names),
                                         "",
-                                        "This data is for SILENT internal use only. Follow the system prompt workflow for when and how to use it.",
-                                        "Identity is confirmed ONLY when caller states a name AND it matches both first and last name above.",
-                                        "For any field marked MISSING, you MUST ask the caller during the relevant workflow step.",
+                                        "This is not a confirmed patient match.",
+                                        "After the caller confirms both first name and last name, call resolve_phonebook_identity.",
+                                        "Only use stored patient details if resolve_phonebook_identity returns matched=true.",
+                                        "If it returns matched=false, treat the caller as a new patient and collect all required details.",
                                         "NEVER mention this data to the caller. NEVER say their name first.",
                                     ]
                                     _pb_context = "\n".join(_pb_lines)
@@ -298,8 +303,7 @@ class RTMiddleTier:
                                             }
                                         })
                                     )
-                                    logger.info(f"[PHONEBOOK] Injected match for {_pb_match.get('first_name')} {_pb_match.get('last_name')} into OpenAI session")
-                                    logger.info(f"[PHONEBOOK DEBUG] birth_date={_pb_match.get('birth_date')}, email={_pb_match.get('email')}, address={_pb_match.get('address')}, zip={_pb_match.get('zip_code')}, city={_pb_match.get('city')}, phone={_pb_match.get('phone')}")
+                                    logger.info(f"[PHONEBOOK] Injected {len(_pb_candidates)} candidate(s) for identity resolution")
                         except Exception as _pb_err:
                             logger.warning(f"[PHONEBOOK] Failed to inject context into session: {_pb_err}")
                         # --- END PHONEBOOK INJECTION ---
@@ -552,7 +556,27 @@ class RTMiddleTier:
                                                     _session_calendars = await epaad_client.get_calendars()
                                                 return _session_calendars
 
-                                            if _func_name == "get_available_doctors":
+                                            if _func_name == "resolve_phonebook_identity":
+                                                try:
+                                                    __first = (_args.get("patient_first_name") or "").strip()
+                                                    __last = (_args.get("patient_last_name") or "").strip()
+                                                    __resolution = session_manager.resolve_phonebook_identity(
+                                                        session_id=session_id,
+                                                        first_name=__first,
+                                                        last_name=__last,
+                                                    )
+                                                    logger.info(
+                                                        "[PHONEBOOK] Identity resolution session=%s matched=%s candidate_count=%s",
+                                                        session_id,
+                                                        __resolution.get("matched"),
+                                                        __resolution.get("candidate_count"),
+                                                    )
+                                                    _result = _json_dumps(__resolution)
+                                                except Exception as __e:
+                                                    logger.error(f"Error in resolve_phonebook_identity: {__e}")
+                                                    _result = _json_dumps({"matched": False, "is_new_patient": False, "status": "error", "message": str(__e)})
+
+                                            elif _func_name == "get_available_doctors":
                                                 __doctors = []
                                                 try:
                                                     __calendars = await _get_cached_calendars()
@@ -787,42 +811,58 @@ class RTMiddleTier:
                                                         raise ValueError("blocked: invalid calendar_id")
                                                     # --- END ENFORCEMENT ---
 
-                                                    # --- AUTO-FILL FROM PHONEBOOK ---
-                                                    # If OpenAI didn't provide data (marked MISSING or empty), use phonebook
+                                                    # Resolve identity before autofill. Existing patient requires
+                                                    # caller phone + first name + last name to all match.
+                                                    __f_name = _args.get("patient_first_name")
+                                                    __l_name = _args.get("patient_last_name")
+                                                    if __f_name == "[REDACTED]" or __l_name == "[REDACTED]":
+                                                        logging.getLogger("utils.rtmt").warning(f"[BOOKING WARN] Model sent [REDACTED] for name.")
+
                                                     try:
-                                                        __caller_session = session_manager.active_sessions.get(session_id)
-                                                        __caller_phone = __caller_session.participants[0]["phone_number"] if __caller_session and __caller_session.participants else None
-                                                        if __caller_phone:
-                                                            from utils.phonebook_lookup import get_phonebook_lookup
-                                                            __pb_lookup = get_phonebook_lookup()
-                                                            if __pb_lookup:
-                                                                __pb_match = __pb_lookup.lookup_by_phone(__caller_phone)
-                                                                if __pb_match:
-                                                                    # Auto-fill DOB
-                                                                    if not _args.get("patient_dob") or _args.get("patient_dob") in ("MISSING", ""):
-                                                                        if __pb_match.birth_date and __pb_match.birth_date not in ("MISSING", ""):
-                                                                            _args["patient_dob"] = __pb_match.birth_date
-                                                                            logger.info(f"[BOOKING AUTO-FILL] DOB from phonebook: {__pb_match.birth_date}")
-                                                                    # Auto-fill street/address
-                                                                    if not _args.get("street") or _args.get("street") in ("MISSING", ""):
-                                                                        if __pb_match.address and __pb_match.address not in ("MISSING", ""):
-                                                                            _args["street"] = __pb_match.address
-                                                                            logger.info(f"[BOOKING AUTO-FILL] Address from phonebook: {__pb_match.address}")
-                                                                    # Auto-fill zip_code
-                                                                    if not _args.get("zip_code") or _args.get("zip_code") in ("MISSING", ""):
-                                                                        if __pb_match.zip_code and __pb_match.zip_code not in ("MISSING", ""):
-                                                                            _args["zip_code"] = __pb_match.zip_code
-                                                                            logger.info(f"[BOOKING AUTO-FILL] Zip from phonebook: {__pb_match.zip_code}")
-                                                                    # Auto-fill city
-                                                                    if not _args.get("city") or _args.get("city") in ("MISSING", ""):
-                                                                        if __pb_match.city and __pb_match.city not in ("MISSING", ""):
-                                                                            _args["city"] = __pb_match.city
-                                                                            logger.info(f"[BOOKING AUTO-FILL] City from phonebook: {__pb_match.city}")
-                                                                    # Auto-fill email
-                                                                    if not _args.get("patient_email") or _args.get("patient_email") in ("MISSING", ""):
-                                                                        if __pb_match.email and __pb_match.email not in ("MISSING", ""):
-                                                                            _args["patient_email"] = __pb_match.email
-                                                                            logger.info(f"[BOOKING AUTO-FILL] Email from phonebook: {__pb_match.email}")
+                                                        if session_id and __f_name and __l_name and not _resolved_phonebook_match():
+                                                            __resolution = session_manager.resolve_phonebook_identity(
+                                                                session_id=session_id,
+                                                                first_name=__f_name,
+                                                                last_name=__l_name,
+                                                            )
+                                                            logger.info(
+                                                                "[PHONEBOOK] Booking-time identity resolution matched=%s candidate_count=%s",
+                                                                __resolution.get("matched"),
+                                                                __resolution.get("candidate_count"),
+                                                            )
+                                                    except Exception as __resolve_err:
+                                                        logger.warning(f"[PHONEBOOK] Booking-time identity resolution failed: {__resolve_err}")
+
+                                                    # --- AUTO-FILL FROM PHONEBOOK ---
+                                                    # If OpenAI didn't provide data (marked MISSING or empty), use the resolved match only.
+                                                    try:
+                                                        __pb_match = _resolved_phonebook_match()
+                                                        if __pb_match:
+                                                            # Auto-fill DOB
+                                                            if not _args.get("patient_dob") or _args.get("patient_dob") in ("MISSING", ""):
+                                                                if __pb_match.get("birth_date") and __pb_match.get("birth_date") not in ("MISSING", ""):
+                                                                    _args["patient_dob"] = __pb_match["birth_date"]
+                                                                    logger.info(f"[BOOKING AUTO-FILL] DOB from resolved phonebook match: {__pb_match['birth_date']}")
+                                                            # Auto-fill street/address
+                                                            if not _args.get("street") or _args.get("street") in ("MISSING", ""):
+                                                                if __pb_match.get("address") and __pb_match.get("address") not in ("MISSING", ""):
+                                                                    _args["street"] = __pb_match["address"]
+                                                                    logger.info(f"[BOOKING AUTO-FILL] Address from resolved phonebook match: {__pb_match['address']}")
+                                                            # Auto-fill zip_code
+                                                            if not _args.get("zip_code") or _args.get("zip_code") in ("MISSING", ""):
+                                                                if __pb_match.get("zip_code") and __pb_match.get("zip_code") not in ("MISSING", ""):
+                                                                    _args["zip_code"] = __pb_match["zip_code"]
+                                                                    logger.info(f"[BOOKING AUTO-FILL] Zip from resolved phonebook match: {__pb_match['zip_code']}")
+                                                            # Auto-fill city
+                                                            if not _args.get("city") or _args.get("city") in ("MISSING", ""):
+                                                                if __pb_match.get("city") and __pb_match.get("city") not in ("MISSING", ""):
+                                                                    _args["city"] = __pb_match["city"]
+                                                                    logger.info(f"[BOOKING AUTO-FILL] City from resolved phonebook match: {__pb_match['city']}")
+                                                            # Auto-fill email
+                                                            if not _args.get("patient_email") or _args.get("patient_email") in ("MISSING", ""):
+                                                                if __pb_match.get("email") and __pb_match.get("email") not in ("MISSING", ""):
+                                                                    _args["patient_email"] = __pb_match["email"]
+                                                                    logger.info(f"[BOOKING AUTO-FILL] Email from resolved phonebook match: {__pb_match['email']}")
                                                     except Exception as __auto_err:
                                                         logger.warning(f"[BOOKING AUTO-FILL] Failed to auto-fill from phonebook: {__auto_err}")
                                                     # --- END AUTO-FILL ---
@@ -879,30 +919,19 @@ class RTMiddleTier:
                                                         logger.info(f"[BOOKING] Type 61 (15 min)")
                                                     # --- END APPOINTMENT TYPE SELECTION ---
 
-                                                    __f_name = _args.get("patient_first_name")
-                                                    __l_name = _args.get("patient_last_name")
-                                                    if __f_name == "[REDACTED]" or __l_name == "[REDACTED]":
-                                                        logging.getLogger("utils.rtmt").warning(f"[BOOKING WARN] Model sent [REDACTED] for name.")
-
                                                     # Map gender: prefer AI-detected voice gender, then phonebook fallback
                                                     __gender = (_args.get("patient_gender") or "").lower()
                                                     if __gender not in ["male", "female"]:
                                                         __gender = "other"
                                                         try:
-                                                            __caller_session = session_manager.active_sessions.get(session_id)
-                                                            __caller_phone = __caller_session.participants[0]["phone_number"] if __caller_session and __caller_session.participants else None
-                                                            if __caller_phone:
-                                                                from utils.phonebook_lookup import get_phonebook_lookup
-                                                                __pb_lookup = get_phonebook_lookup()
-                                                                if __pb_lookup:
-                                                                    __pb_match = __pb_lookup.lookup_by_phone(__caller_phone)
-                                                                    if __pb_match and __pb_match.gender:
-                                                                        __g = __pb_match.gender.strip().lower()
-                                                                        if __g in ("m", "männlich", "male", "maennlich"):
-                                                                            __gender = "male"
-                                                                        elif __g in ("w", "f", "weiblich", "female", "frau"):
-                                                                            __gender = "female"
-                                                                        logger.info(f"[GENDER] From phonebook: '{__gender}'")
+                                                            __pb_match = _resolved_phonebook_match()
+                                                            if __pb_match and __pb_match.get("gender"):
+                                                                __g = __pb_match["gender"].strip().lower()
+                                                                if __g in ("m", "männlich", "male", "maennlich"):
+                                                                    __gender = "male"
+                                                                elif __g in ("w", "f", "weiblich", "female", "frau"):
+                                                                    __gender = "female"
+                                                                logger.info(f"[GENDER] From resolved phonebook match: '{__gender}'")
                                                         except Exception as __ge:
                                                             logger.warning(f"[GENDER] Phonebook gender lookup failed: {__ge}")
 

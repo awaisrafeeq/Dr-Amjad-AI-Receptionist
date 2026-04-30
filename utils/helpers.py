@@ -86,6 +86,19 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                     },
                     {
                         "type": "function",
+                        "name": "resolve_phonebook_identity",
+                        "description": "After the caller confirms their first and last name, determine whether this caller is an existing patient. Existing patient requires all three fields to match: caller phone number, first name, and last name. If any field differs, treat as a new patient.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "patient_first_name": {"type": "string", "description": "The caller's confirmed first name."},
+                                "patient_last_name": {"type": "string", "description": "The caller's confirmed last name."}
+                            },
+                            "required": ["patient_first_name", "patient_last_name"]
+                        }
+                    },
+                    {
+                        "type": "function",
                         "name": "book_appointment",
                         "description": "Book an appointment for a patient. All required fields must be populated with real data before calling.",
                         "parameters": {

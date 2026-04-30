@@ -32,7 +32,7 @@ venv/
 # Data & Documents
 # *.xlsx
 *.xls
-*.xlsx
+# *.xlsx
 *.pdf
 *.doc
 *.docx

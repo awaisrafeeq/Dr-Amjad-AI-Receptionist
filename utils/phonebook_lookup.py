@@ -4,6 +4,7 @@ import tempfile
 import hashlib
 import threading
 import logging
+import unicodedata
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Any, List, Tuple
 
@@ -86,6 +87,14 @@ def _cell_to_str(value: Any) -> Optional[str]:
         return str(value).strip() or None
     except Exception:
         return None
+
+
+def _normalize_name(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    normalized = unicodedata.normalize("NFKD", value)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return " ".join(normalized.strip().lower().split())
 
 import time as _time
 
@@ -449,7 +458,7 @@ class PhonebookLookup:
                 return False
 
     def lookup_by_phone(self, phone: Optional[str]) -> Optional[PhonebookMatch]:
-        """Returns the first phonebook match for the given phone number."""
+        """Returns a phonebook match only when the phone maps to one patient."""
         if not phone:
             return None
 
@@ -458,7 +467,28 @@ class PhonebookLookup:
         for v in normalize_phone_variants(phone):
             matches = self._index.get(v)
             if matches:
-                return matches[0]
+                return matches[0] if len(matches) == 1 else None
+
+        return None
+
+    def lookup_candidates_by_phone(self, phone: Optional[str]) -> List[PhonebookMatch]:
+        """Return all patient candidates for a caller phone number."""
+        if not phone:
+            return []
+
+        self.load()
+
+        seen: set[Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]] = set()
+        candidates: List[PhonebookMatch] = []
+        for v in normalize_phone_variants(phone):
+            for match in self._index.get(v, []):
+                key = (match.patient_number, match.first_name, match.last_name, match.birth_date)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(match)
+
+        return candidates
 
     def lookup_by_phone_and_name(self, phone: Optional[str], first_name: Optional[str], last_name: Optional[str]) -> Optional[PhonebookMatch]:
         """Returns the phonebook match for the given phone number that also matches the provided name."""
@@ -467,8 +497,8 @@ class PhonebookLookup:
 
         self.load()
         
-        cmp_first = (first_name or "").strip().lower()
-        cmp_last = (last_name or "").strip().lower()
+        cmp_first = _normalize_name(first_name)
+        cmp_last = _normalize_name(last_name)
 
         for v in normalize_phone_variants(phone):
             matches = self._index.get(v)
@@ -476,8 +506,8 @@ class PhonebookLookup:
                 # Both first AND last name must match — one phone can belong to multiple people
                 if cmp_first and cmp_last:
                     for m in matches:
-                        m_first = (m.first_name or "").strip().lower()
-                        m_last = (m.last_name or "").strip().lower()
+                        m_first = _normalize_name(m.first_name)
+                        m_last = _normalize_name(m.last_name)
                         if cmp_first == m_first and cmp_last == m_last:
                             return m
                     # Phone matched but neither entry had matching both names → no identity match
