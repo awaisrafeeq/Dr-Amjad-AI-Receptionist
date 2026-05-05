@@ -6,6 +6,8 @@ Uses Azure Communication Services Email or SendGrid for email delivery.
 import os
 import logging
 import asyncio
+import html
+import re
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import aiohttp
@@ -45,6 +47,22 @@ class EmailService:
             Email address or None if not configured
         """
         return self.doctor_emails.get(doctor_key.lower())
+
+    def _parse_recipients(self, recipient: Optional[str]) -> List[str]:
+        """Parse one or more comma/semicolon-separated email recipients."""
+        raw = recipient or self.default_recipient
+        recipients: List[str] = []
+        seen = set()
+        for email in re.split(r"[,;]", raw):
+            email = email.strip()
+            if not email:
+                continue
+            email_key = email.lower()
+            if email_key in seen:
+                continue
+            seen.add(email_key)
+            recipients.append(email)
+        return recipients
     
     def determine_recipient_from_transcript(self, transcript_data: List[Dict[str, Any]]) -> Optional[str]:
         """
@@ -121,10 +139,16 @@ class EmailService:
         """
         try:
             recipient = recipient or self.default_recipient
+            recipients = self._parse_recipients(recipient)
+            if not recipients:
+                logger.error("No email recipients configured. Set EMAIL_DEFAULT_RECIPIENT.")
+                return False
             
             # Format the transcript
             transcript_html = self._format_transcript_html(transcript_data)
             transcript_text = self._format_transcript_text(transcript_data)
+            summary_text = await self._build_german_summary(transcript_data, transcript_text)
+            summary_html = self._format_summary_html(summary_text)
             
             # Build email subject
             caller_phone = caller_info.get("phone", "Unknown") if caller_info else "Unknown"
@@ -156,6 +180,9 @@ class EmailService:
                 <div style="border-left: 3px solid #2c5aa0; padding-left: 15px;">
                     {transcript_html}
                 </div>
+
+                <h3 style="color: #2c5aa0; margin-top: 25px;">Kurze Zusammenfassung (Deutsch):</h3>
+                {summary_html}
                 
                 <hr style="margin-top: 30px; border: none; border-top: 1px solid #ddd;">
                 <p style="font-size: 12px; color: #666;">
@@ -177,6 +204,10 @@ Date: {timestamp}
 
 {transcript_text}
 
+--- Kurze Zusammenfassung (Deutsch) ---
+
+{summary_text}
+
 ---
 This is an automated transcript from the MedCenter Volta AI Reception System.
 Please review for accuracy and follow up as needed.
@@ -185,7 +216,7 @@ Please review for accuracy and follow up as needed.
             # Try Azure Communication Services Email first
             if self.connection_string:
                 success = await self._send_via_acs_email(
-                    recipient=recipient,
+                    recipients=recipients,
                     subject=subject,
                     html_body=html_body,
                     text_body=text_body
@@ -196,7 +227,7 @@ Please review for accuracy and follow up as needed.
             # Fallback to SendGrid
             if self.sendgrid_api_key:
                 success = await self._send_via_sendgrid(
-                    recipient=recipient,
+                    recipients=recipients,
                     subject=subject,
                     html_body=html_body,
                     text_body=text_body
@@ -210,6 +241,198 @@ Please review for accuracy and follow up as needed.
         except Exception as e:
             logger.error(f"Error sending transcript email: {e}")
             return False
+
+    async def _build_german_summary(self, transcript_data: List[Dict[str, Any]], transcript_text: str) -> str:
+        """Create a medium-length German paragraph summary for the transcript email."""
+        llm_summary = await self._generate_german_summary_with_llm(transcript_text)
+        if llm_summary:
+            return llm_summary
+        return self._build_fallback_german_summary(transcript_data)
+
+    async def _generate_german_summary_with_llm(self, transcript_text: str) -> Optional[str]:
+        """Use Azure OpenAI to summarize the full transcript, with safe fallback on any error."""
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        api_key = os.getenv("AZURE_OPENAI_KEY")
+        api_version = os.getenv("AZURE_OPENAI_SUMMARY_API_VERSION") or os.getenv("AZURE_OPENAI_API_VERSION")
+        deployment = (
+            os.getenv("AZURE_OPENAI_SUMMARY_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_DEPLOYMENT")
+        )
+
+        if not endpoint or not api_key or not api_version or not deployment:
+            logger.warning("[EMAIL SUMMARY] Azure OpenAI summary config missing; using fallback summary")
+            return None
+
+        safe_transcript = (transcript_text or "").strip()
+        if not safe_transcript:
+            return None
+        if len(safe_transcript) > 14000:
+            safe_transcript = safe_transcript[-14000:]
+
+        try:
+            from openai import AsyncAzureOpenAI
+
+            client = AsyncAzureOpenAI(
+                azure_endpoint=endpoint,
+                api_key=api_key,
+                api_version=api_version,
+            )
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=deployment,
+                    temperature=0.2,
+                    max_tokens=220,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Du fasst Telefontranskripte fuer eine Arztpraxis zusammen. "
+                                "Schreibe ausschliesslich auf Deutsch, als einen einzigen mittellangen Absatz. "
+                                "Keine Bulletpoints, keine Ueberschrift. "
+                                "Laenge: 4 bis 5 Saetze, etwa 70 bis 110 Woerter. "
+                                "Erwaehne nur wichtige Punkte: Anliegen, Patientendaten/Identifikation falls relevant, Arzt, Terminwunsch, finaler gebuchter Termin oder Ergebnis. "
+                                "Schreibe Patientennamen immer in lateinischen Buchstaben, auch wenn sie im Transkript in arabischer, chinesischer oder anderer Schrift vorkommen. "
+                                "Wenn der Anrufer sich korrigiert hat, verwende nur die final bestaetigte Information. "
+                                "Keine erfundenen Details."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Transkript:\n{safe_transcript}",
+                        },
+                    ],
+                ),
+                timeout=12,
+            )
+            summary = (response.choices[0].message.content or "").strip()
+            summary = re.sub(r"\s+", " ", summary)
+            if summary:
+                logger.info("[EMAIL SUMMARY] Generated German summary via Azure OpenAI")
+                return summary
+        except Exception as e:
+            logger.warning(f"[EMAIL SUMMARY] Azure OpenAI summary failed; using fallback summary: {e}")
+        return None
+
+    def _build_fallback_german_summary(self, transcript_data: List[Dict[str, Any]]) -> str:
+        """Fallback summary when LLM generation is unavailable."""
+        if not transcript_data:
+            return "Es liegt keine Transkription vor."
+
+        cleaned_entries = []
+        for entry in transcript_data:
+            speaker = entry.get("speaker", "unknown")
+            text = self._clean_summary_text(entry.get("utterance_text", ""))
+            if text:
+                cleaned_entries.append({"speaker": speaker, "text": text})
+
+        if not cleaned_entries:
+            return "Es wurden keine wichtigen Punkte automatisch erkannt."
+
+        all_text = " ".join(item["text"].lower() for item in cleaned_entries)
+        summary: List[str] = []
+
+        if any(word in all_text for word in ("termin", "appointment", "book", "scheduled", "gebucht")):
+            summary.append("Es ging hauptsaechlich um eine Terminvereinbarung")
+        elif any(word in all_text for word in ("rezept", "prescription", "medikament", "medication")):
+            summary.append("Es ging hauptsaechlich um eine Rezept- oder Medikamentenanfrage")
+        elif any(word in all_text for word in ("zeugnis", "attest", "certificate", "sick note", "krankmeldung")):
+            summary.append("Es ging hauptsaechlich um ein aerztliches Zeugnis oder eine Krankmeldung")
+
+        doctor_name = self._extract_doctor_name(" ".join(item["text"] for item in cleaned_entries))
+        if doctor_name:
+            summary.append(f"Der Arztbezug war {doctor_name}")
+
+        outcome_line = self._find_last_matching_line(
+            cleaned_entries,
+            ("scheduled", "booked", "appointment has been", "termin ist", "termin wurde", "gebucht", "vereinbart", "buchen"),
+        )
+        if outcome_line:
+            appointment_detail = self._extract_appointment_detail(outcome_line)
+            if appointment_detail:
+                summary.append(f"Als Ergebnis wurde ein Termin vereinbart oder bestaetigt ({appointment_detail})")
+            else:
+                summary.append("Als Ergebnis wurde der Termin im Gespraech vereinbart oder weiter bearbeitet")
+
+        important_customer_line = self._find_first_matching_line(
+            [item for item in cleaned_entries if item["speaker"] in ("customer", "caller")],
+            ("ich brauche", "i need", "i want", "moechte", "möchte", "rezept", "termin", "appointment", "prescription"),
+        )
+        if important_customer_line and not summary:
+            summary.append(self._describe_customer_need(important_customer_line).rstrip("."))
+
+        if not summary:
+            fallback = next((item["text"] for item in cleaned_entries if item["speaker"] in ("customer", "caller")), "")
+            if fallback:
+                summary.append(f"Eine wichtige Angabe des Anrufers war: {fallback}")
+            else:
+                summary.append("Es wurden keine wichtigen Punkte automatisch erkannt")
+
+        paragraph = ". ".join(part.strip().rstrip(".") for part in summary[:4] if part.strip())
+        return paragraph[:1].upper() + paragraph[1:] + "."
+
+    def _clean_summary_text(self, text: str) -> str:
+        text = re.sub(r"\s+", " ", (text or "")).strip()
+        if not text:
+            return ""
+        if len(text.split()) <= 2 and text.lower().strip(".!?") in {"yes", "yeah", "ok", "okay", "no", "bye", "ja", "nein"}:
+            return ""
+        if len(text) > 220:
+            text = text[:217].rstrip() + "..."
+        return text
+
+    def _find_first_matching_line(self, entries: List[Dict[str, str]], keywords: tuple) -> str:
+        for item in entries:
+            text = item["text"]
+            lower = text.lower()
+            if any(keyword in lower for keyword in keywords):
+                return text
+        return ""
+
+    def _find_last_matching_line(self, entries: List[Dict[str, str]], keywords: tuple) -> str:
+        for item in reversed(entries):
+            text = item["text"]
+            lower = text.lower()
+            if any(keyword in lower for keyword in keywords):
+                return text
+        return ""
+
+    def _extract_doctor_name(self, text: str) -> str:
+        match = re.search(r"\bDr\.?\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß'-]+(?:\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß'-]+)?", text)
+        if match:
+            return match.group(0).strip()
+        return ""
+
+    def _extract_appointment_detail(self, text: str) -> str:
+        details = []
+        date_match = re.search(
+            r"\b(?:\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?|\d{4}-\d{2}-\d{2}|"
+            r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Januar|Februar|Maerz|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?|"
+            r"\d{1,2}\.\s*(?:Januar|Februar|Maerz|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember))\b",
+            text,
+            re.IGNORECASE,
+        )
+        time_match = re.search(r"\b\d{1,2}[:.]\d{2}\b", text)
+        if date_match:
+            details.append(date_match.group(0).strip())
+        if time_match:
+            details.append(time_match.group(0).replace(".", ":"))
+        return ", ".join(details)
+
+    def _describe_customer_need(self, text: str) -> str:
+        lower = text.lower()
+        if any(word in lower for word in ("appointment", "termin", "book")):
+            return "Wichtige Angabe des Anrufers: Der Anrufer wollte einen Termin vereinbaren."
+        if any(word in lower for word in ("prescription", "rezept", "medication", "medikament")):
+            return "Wichtige Angabe des Anrufers: Der Anrufer hatte eine Rezept- oder Medikamentenanfrage."
+        return "Wichtige Angabe des Anrufers: Der Anrufer hatte ein allgemeines Anliegen."
+
+    def _format_summary_html(self, summary_text: str) -> str:
+        return f"""
+                <div style="background-color: #eef6ff; border-left: 3px solid #2c5aa0; padding: 12px 15px; border-radius: 5px;">
+                    <p style="margin: 0;">{html.escape(summary_text)}</p>
+                </div>
+        """
     
     def _format_transcript_html(self, transcript_data: List[Dict[str, Any]]) -> str:
         """Format transcript as HTML."""
@@ -276,7 +499,7 @@ Please review for accuracy and follow up as needed.
     
     async def _send_via_acs_email(
         self, 
-        recipient: str, 
+        recipients: List[str], 
         subject: str, 
         html_body: str, 
         text_body: str
@@ -290,7 +513,7 @@ Please review for accuracy and follow up as needed.
             message = {
                 "senderAddress": self.sender_email,
                 "recipients": {
-                    "to": [{"address": recipient}]
+                    "to": [{"address": email} for email in recipients]
                 },
                 "content": {
                     "subject": subject,
@@ -302,7 +525,7 @@ Please review for accuracy and follow up as needed.
             poller = client.begin_send(message)
             result = await asyncio.to_thread(poller.result)
 
-            logger.info(f"Email sent successfully via ACS to {recipient}")
+            logger.info(f"Email sent successfully via ACS to {', '.join(recipients)}")
             return True
             
         except Exception as e:
@@ -311,7 +534,7 @@ Please review for accuracy and follow up as needed.
     
     async def _send_via_sendgrid(
         self, 
-        recipient: str, 
+        recipients: List[str], 
         subject: str, 
         html_body: str, 
         text_body: str
@@ -322,7 +545,7 @@ Please review for accuracy and follow up as needed.
             
             payload = {
                 "personalizations": [{
-                    "to": [{"email": recipient}]
+                    "to": [{"email": email} for email in recipients]
                 }],
                 "from": {"email": self.sender_email},
                 "subject": subject,
@@ -340,7 +563,7 @@ Please review for accuracy and follow up as needed.
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, headers=headers) as response:
                     if response.status in [200, 202]:
-                        logger.info(f"Email sent successfully via SendGrid to {recipient}")
+                        logger.info(f"Email sent successfully via SendGrid to {', '.join(recipients)}")
                         return True
                     else:
                         logger.warning(f"SendGrid failed with status {response.status}")

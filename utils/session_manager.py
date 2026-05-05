@@ -49,7 +49,60 @@ class SessionManager:
         self.active_sessions: Dict[str, CallSession] = {}
         self._session_lock = asyncio.Lock()
         self._cleanup_in_progress: set = set()  # guards against concurrent cleanup from WS + CallDisconnected
+        self._hangup_in_progress: set[str] = set()
+        self._hangup_completed: set[str] = set()
+        self._realtime_sessions: set[str] = set()
         # self.session_call_mapping: Dict[str, str] = {}  # call_connection_id -> session_id
+
+    def _hangup_key(self, session_id: str, call_connection_id: str) -> str:
+        return f"{session_id}:{call_connection_id}"
+
+    async def begin_hangup(self, session_id: str, call_connection_id: str) -> bool:
+        """Reserve a hangup attempt for this session/call pair.
+
+        Returns False when another realtime loop already sent or is sending the
+        same hangup. This must be shared across RTMiddleTier instances because
+        ACS can create overlapping websocket loops for one call.
+        """
+        key = self._hangup_key(session_id, call_connection_id)
+        async with self._session_lock:
+            if key in self._hangup_completed or key in self._hangup_in_progress:
+                return False
+            self._hangup_in_progress.add(key)
+            return True
+
+    async def finish_hangup(self, session_id: str, call_connection_id: str, success: bool) -> None:
+        key = self._hangup_key(session_id, call_connection_id)
+        async with self._session_lock:
+            self._hangup_in_progress.discard(key)
+            if success:
+                self._hangup_completed.add(key)
+
+    async def begin_cleanup(self, session_id: Optional[str]) -> bool:
+        """Reserve session cleanup so WS and ACS callbacks cannot both run it."""
+        if not session_id:
+            return False
+        async with self._session_lock:
+            if session_id in self._cleanup_in_progress:
+                return False
+            self._cleanup_in_progress.add(session_id)
+            return True
+
+    async def begin_realtime_session(self, session_id: Optional[str]) -> bool:
+        """Allow only one active OpenAI realtime bridge per call session."""
+        if not session_id:
+            return True
+        async with self._session_lock:
+            if session_id in self._realtime_sessions:
+                return False
+            self._realtime_sessions.add(session_id)
+            return True
+
+    async def end_realtime_session(self, session_id: Optional[str]) -> None:
+        if not session_id:
+            return
+        async with self._session_lock:
+            self._realtime_sessions.discard(session_id)
         
     async def create_session(self, event: Dict[Any, Any], event_type: str) -> str:
         """
@@ -235,6 +288,15 @@ class SessionManager:
             # Remove from active sessions
             async with self._session_lock:
                 self.active_sessions.pop(session_id, None)
+                if session_id:
+                    prefix = f"{session_id}:"
+                    self._hangup_in_progress = {
+                        key for key in self._hangup_in_progress if not key.startswith(prefix)
+                    }
+                    self._hangup_completed = {
+                        key for key in self._hangup_completed if not key.startswith(prefix)
+                    }
+                    self._realtime_sessions.discard(session_id)
             self._cleanup_in_progress.discard(session_id)
 
             logger.info(f"[SESSION] Ended: {session_id}")

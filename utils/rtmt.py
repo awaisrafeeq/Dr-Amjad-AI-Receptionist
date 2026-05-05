@@ -31,6 +31,7 @@ except Exception:  # pragma: no cover
 
 import os
 import re
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 try:
     from zoneinfo import ZoneInfo
@@ -39,6 +40,26 @@ except ImportError:
 
 config = get_config()
 logger = logging.getLogger(__name__)
+
+_LATIN_NAME_EXTRA_CHARS = set(" -'.`´’")
+
+
+def _is_latin_name(value: Optional[str]) -> bool:
+    """Return True when a patient name uses Latin-script letters only."""
+    if not value:
+        return False
+    for char in value.strip():
+        if char in _LATIN_NAME_EXTRA_CHARS:
+            continue
+        if char.isalpha():
+            try:
+                if "LATIN" not in unicodedata.name(char):
+                    return False
+            except ValueError:
+                return False
+            continue
+        return False
+    return True
 
 class RTMiddleTier:
     
@@ -196,6 +217,7 @@ class RTMiddleTier:
                                         "type": "response.create",
                                         "response": {
                                             "modalities": ["audio", "text"],
+                                            "voice": self.selected_voice,
                                             "instructions": instructions,
                                         },
                                     }
@@ -232,14 +254,36 @@ class RTMiddleTier:
                             )
                             return False
 
+                        if not await session_manager.begin_hangup(session_id, _conn_id):
+                            hangup_sent = True
+                            logger.info(
+                                f"{_tag} Skipping — shared hangup guard already handled "
+                                f"session={session_id[:8]}, call_connection_id={_conn_id[:12]}..."
+                            )
+                            return True
+
                         try:
                             from utils.acs import acs_caller as _acs_ref
                             logger.info(f"{_tag} Sending hang_up for call_connection_id={_conn_id[:12]}...")
                             await _acs_ref.hang_up(_conn_id)
                             hangup_sent = True
+                            await session_manager.finish_hangup(session_id, _conn_id, success=True)
                             logger.info(f"{_tag} SUCCESS — ACS hangup sent for session={session_id[:8]}")
                             return True
+                        except asyncio.CancelledError:
+                            await session_manager.finish_hangup(session_id, _conn_id, success=False)
+                            raise
                         except Exception as _hup_err:
+                            _err_text = str(_hup_err)
+                            if "Call not found" in _err_text or "ResourceNotFound" in _err_text or "(8522)" in _err_text:
+                                hangup_sent = True
+                                await session_manager.finish_hangup(session_id, _conn_id, success=True)
+                                logger.info(
+                                    f"{_tag} Call already gone — treating hangup as complete "
+                                    f"for session={session_id[:8]}"
+                                )
+                                return True
+                            await session_manager.finish_hangup(session_id, _conn_id, success=False)
                             logger.error(f"{_tag} EXCEPTION during hang_up: {_hup_err}", exc_info=True)
                             return False
 
@@ -321,7 +365,7 @@ class RTMiddleTier:
                                     "type": "response.create",
                                     "response": {
                                         "modalities": ["audio", "text"],
-                                        "voice": "shimmer",
+                                        "voice": self.selected_voice,
                                         "instructions": (
                                             f"Say EXACTLY and ONLY this sentence, word for word, nothing before it and nothing after it: "
                                             f'"{hardcoded_greeting}"'
@@ -341,10 +385,11 @@ class RTMiddleTier:
                         if not is_acs_audio_stream:
                             return
 
-                        # Silence policy (seconds)
-                        prompt_1_after = 45   # First "are you there?" prompt
-                        prompt_2_after = 90   # Second prompt
-                        hangup_after = 180    # Auto-hangup (3 minutes total)
+                        # Silence policy (seconds). Keep early prompts short so callers
+                        # know the line is still active during pauses or weak audio.
+                        prompt_1_after = 12
+                        prompt_2_after = 30
+                        hangup_after = 150
 
                         try:
                             while not call_end_requested.is_set():
@@ -393,7 +438,8 @@ class RTMiddleTier:
                                     last_prompt_stage = 2
                                     await send_assistant_prompt(
                                         f"{_lang_instruction}"
-                                        "Ask the caller if they are still there, and if they need help with an appointment or general information."
+                                        "Say one short sentence telling the caller you are still here and waiting for their response. "
+                                        "Do not ask multiple questions."
                                     )
                                     continue
 
@@ -401,7 +447,8 @@ class RTMiddleTier:
                                     last_prompt_stage = 1
                                     await send_assistant_prompt(
                                         f"{_lang_instruction}"
-                                        "Ask the caller if they are still there and how you may assist them today."
+                                        "Say one short sentence such as: 'Please give me a moment, I am still here.' "
+                                        "Use the caller's current language. Do not ask a new workflow question."
                                     )
                                     continue
 
@@ -523,31 +570,68 @@ class RTMiddleTier:
                                         # Run all API work in a background task so the event loop stays
                                         # unblocked — audio frames from OpenAI continue to be forwarded
                                         # to ACS while the function executes, eliminating silence gaps.
+                                        _slow_function_prompts = {
+                                            "get_available_doctors": "I am checking the available doctors, please wait a moment.",
+                                            "get_available_slots": "I am still checking the appointment availability, please wait a moment.",
+                                            "get_next_available_slot": "I am still looking for the next available appointment, please wait a moment.",
+                                            "book_appointment": "I am booking your appointment, please wait a moment.",
+                                        }
+
+                                        async def _send_tool_holding_prompt(_func_name: str, *, keepalive: bool = False):
+                                            nonlocal response_active
+                                            _message = _slow_function_prompts.get(_func_name)
+                                            if not _message or call_end_requested.is_set():
+                                                return
+
+                                            try:
+                                                if response_active:
+                                                    await wait_for_response_idle(timeout=1.0)
+                                                if response_active or call_end_requested.is_set():
+                                                    return
+
+                                                await target_ws.send_str(_json_dumps({
+                                                    "type": "response.create",
+                                                    "response": {
+                                                        "modalities": ["audio", "text"],
+                                                        "voice": self.selected_voice,
+                                                        "tool_choice": "none",
+                                                        "max_output_tokens": 45,
+                                                        "instructions": (
+                                                            f"Say EXACTLY ONE short sentence: '{_message}' "
+                                                            f"in the language the caller is speaking (currently '{detected_conversation_language or 'de'}'). "
+                                                            "Then STOP. Say NOTHING else. Do NOT list anything. Do NOT guess results."
+                                                        )
+                                                    }
+                                                }))
+                                                response_active = True
+                                                response_idle_event.clear()
+                                                _kind = "keepalive" if keepalive else "initial"
+                                                logger.info(f"[HOLDING] {_kind} {_func_name}")
+                                            except Exception as __he:
+                                                logger.debug(f"[HOLDING] Could not send {_func_name}: {__he}")
+
+                                        async def _tool_keepalive_loop(_func_name: str, _stop_event: asyncio.Event):
+                                            # The first short holding prompt is sent immediately. If the API
+                                            # still has not returned, gently reassure the caller every few seconds.
+                                            try:
+                                                await asyncio.sleep(7)
+                                                while not _stop_event.is_set() and not call_end_requested.is_set():
+                                                    await _send_tool_holding_prompt(_func_name, keepalive=True)
+                                                    await asyncio.sleep(9)
+                                            except asyncio.CancelledError:
+                                                pass
+
                                         async def _run_function_call(_call_id, _func_name, _args):
                                             nonlocal detected_conversation_language
                                             _result = ""
+                                            _holding_stop = asyncio.Event()
+                                            _holding_task = None
 
                                             # Send brief holding message for slow functions so caller never hears silence
-                                            if _func_name in ("get_available_slots", "get_next_available_slot", "book_appointment", "get_available_doctors"):
-                                                # Removed sleep(0.15) - yield not needed with proper event handling
-                                                if not response_active:
-                                                    try:
-                                                        await target_ws.send_str(_json_dumps({
-                                                            "type": "response.create",
-                                                            "response": {
-                                                                "modalities": ["audio", "text"],
-                                                                "tool_choice": "none",
-                                                                "max_output_tokens": 40,
-                                                                "instructions": (
-                                                                    f"Say EXACTLY ONE short sentence: 'One moment please.' "
-                                                                    f"in the language the caller is speaking (currently '{detected_conversation_language or 'de'}'). "
-                                                                    "Then STOP. Say NOTHING else. Do NOT list anything. Do NOT guess results."
-                                                                )
-                                                            }
-                                                        }))
-                                                        logger.info(f"[HOLDING] {_func_name}")
-                                                    except Exception as __he:
-                                                        logger.debug(f"[HOLDING] Could not send: {__he}")
+                                            if _func_name in _slow_function_prompts:
+                                                await _send_tool_holding_prompt(_func_name)
+                                                _holding_task = asyncio.create_task(_tool_keepalive_loop(_func_name, _holding_stop))
+                                                _dynamic_tasks.append(_holding_task)
 
                                             async def _get_cached_calendars():
                                                 """Get calendars with session-level caching to avoid duplicate API calls."""
@@ -560,6 +644,19 @@ class RTMiddleTier:
                                                 try:
                                                     __first = (_args.get("patient_first_name") or "").strip()
                                                     __last = (_args.get("patient_last_name") or "").strip()
+                                                    if not _is_latin_name(__first) or not _is_latin_name(__last):
+                                                        logger.warning(
+                                                            "[PHONEBOOK] Non-Latin name rejected in identity resolution: first=%r last=%r",
+                                                            __first,
+                                                            __last,
+                                                        )
+                                                        _result = _json_dumps({
+                                                            "matched": False,
+                                                            "is_new_patient": False,
+                                                            "status": "name_requires_latin",
+                                                            "message": "Patient first and last names must be transliterated into Latin characters before retrying this tool call.",
+                                                        })
+                                                        raise ValueError("blocked: non-latin name")
                                                     __resolution = session_manager.resolve_phonebook_identity(
                                                         session_id=session_id,
                                                         first_name=__first,
@@ -648,6 +745,19 @@ class RTMiddleTier:
                                                     # --- END ENFORCEMENT ---
 
                                                     __target_day = date.fromisoformat(__target_date_str)
+                                                    __now_dt = datetime.now(ZoneInfo("Europe/Zurich"))
+                                                    if __target_day < __now_dt.date():
+                                                        logger.info(
+                                                            f"[SLOTS BLOCKED] Past date requested: {__target_day} "
+                                                            f"(today={__now_dt.date()}), session={session_id}"
+                                                        )
+                                                        _result = _json_dumps({
+                                                            "status": "past_date",
+                                                            "error": "The requested date is in the past. Do not offer slots for past dates. Ask the caller for a future date or offer to search the next available appointment.",
+                                                            "requested_date": __target_day.isoformat(),
+                                                            "today": __now_dt.date().isoformat(),
+                                                        })
+                                                        raise ValueError("blocked: past date")
                                                     __start_dt = datetime.combine(__target_day, datetime.min.time())
                                                     __end_dt = datetime.combine(__target_day, datetime.max.time()).replace(microsecond=0)
 
@@ -663,7 +773,7 @@ class RTMiddleTier:
                                                         opening_hours=default_opening_hours(),
                                                         slot_minutes=15,
                                                         time_of_day=__tod,
-                                                        now_dt=datetime.now(ZoneInfo("Europe/Zurich")),
+                                                        now_dt=__now_dt,
                                                     )
 
                                                     __slot_iso = [__s.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S") for __s in __slots][:10]
@@ -817,6 +927,19 @@ class RTMiddleTier:
                                                     __l_name = _args.get("patient_last_name")
                                                     if __f_name == "[REDACTED]" or __l_name == "[REDACTED]":
                                                         logging.getLogger("utils.rtmt").warning(f"[BOOKING WARN] Model sent [REDACTED] for name.")
+
+                                                    if not _is_latin_name(__f_name) or not _is_latin_name(__l_name):
+                                                        logger.warning(
+                                                            "[BOOKING BLOCKED] Non-Latin patient name rejected: first=%r last=%r",
+                                                            __f_name,
+                                                            __l_name,
+                                                        )
+                                                        _result = _json_dumps({
+                                                            "status": "error",
+                                                            "error": "name_requires_latin",
+                                                            "message": "Patient first and last names must be transliterated into Latin characters before booking.",
+                                                        })
+                                                        raise ValueError("blocked: non-latin name")
 
                                                     try:
                                                         if session_id and __f_name and __l_name and not _resolved_phonebook_match():
@@ -1167,11 +1290,15 @@ class RTMiddleTier:
                                                     logger.error(f"Error in search_knowledge_base: {__e}")
                                                     _result = _json_dumps({"status": "error", "message": str(__e)})
 
+                                            _holding_stop.set()
+                                            if _holding_task and not _holding_task.done():
+                                                _holding_task.cancel()
+
                                             # Cancel any still-active holding response before sending tool output.
                                             # This prevents the AI from saying "no slots available" (guess)
                                             # then "actually I see slots" (real data) — the contradiction problem.
                                             if _func_name != "terminate_call":
-                                                if response_active:
+                                                if response_active or _func_name in _slow_function_prompts:
                                                     try:
                                                         await target_ws.send_str(_json_dumps({"type": "response.cancel"}))
                                                         logger.debug(f"[TOOL] Cancelled holding response before submitting {_func_name} result")
@@ -1197,7 +1324,11 @@ class RTMiddleTier:
                                                 await wait_for_response_idle(timeout=1.5)
                                                 logger.debug(f"[FUNCTION RESULT] Sending response.create after {_func_name}")
                                                 await target_ws.send_str(_json_dumps({
-                                                    "type": "response.create"
+                                                    "type": "response.create",
+                                                    "response": {
+                                                        "modalities": ["audio", "text"],
+                                                        "voice": self.selected_voice,
+                                                    }
                                                 }))
                                             else:
                                                 logger.info(f"[FUNCTION RESULT] Skipping response.create — call_end_requested is set (func={_func_name})")
@@ -1366,6 +1497,12 @@ class RTMiddleTier:
                                     await task
                                 except (asyncio.CancelledError, Exception):
                                     pass
+
+                        if _transcription_flush_task and not _transcription_flush_task.done():
+                            try:
+                                await asyncio.wait_for(_transcription_flush_task, timeout=2.0)
+                            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                                logger.warning("[TRANSCRIPT] Flush task did not finish during cleanup")
 
                         # Ensure the ACS call is hung up so CallDisconnected event fires
                         logger.info(f"[CLEANUP] Forward loop ended — ensuring ACS call is hung up. session={session_id}, call_end_requested={call_end_requested.is_set()}")

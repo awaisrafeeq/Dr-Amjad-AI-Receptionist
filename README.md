@@ -145,6 +145,7 @@ EPAAD_TIMEZONE=Europe/Zurich
 
 ### Email Configuration
 ```env
+EMAIL_DEFAULT_RECIPIENT=frontdesk@example.com,backup@example.com
 DOCTOR_EMAILS_JSON={"mallisho":"mallisho@example.com",...}
 ```
 

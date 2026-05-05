@@ -14,11 +14,12 @@ export PORT=${PORT:-8000}
 
 echo "Starting uvicorn on port $PORT..."
 
-# Use 4 workers for production, binding to 0.0.0.0 for Azure
+# Use a single worker because call/session state is kept in memory.
+# Multiple workers can route ACS callbacks and WebSocket streams to different
+# processes, causing duplicate greetings, voice mixing, and cleanup races.
 python -m uvicorn app:app \
     --host 0.0.0.0 \
     --port $PORT \
-    --workers 4 \
     --loop uvloop \
     --http h11 \
     --ws websockets \

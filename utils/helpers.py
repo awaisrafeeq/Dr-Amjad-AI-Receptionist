@@ -91,8 +91,8 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "patient_first_name": {"type": "string", "description": "The caller's confirmed first name."},
-                                "patient_last_name": {"type": "string", "description": "The caller's confirmed last name."}
+                                "patient_first_name": {"type": "string", "description": "The caller's confirmed first name transliterated into Latin characters only."},
+                                "patient_last_name": {"type": "string", "description": "The caller's confirmed last name transliterated into Latin characters only."}
                             },
                             "required": ["patient_first_name", "patient_last_name"]
                         }
@@ -106,8 +106,8 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                             "properties": {
                                 "calendar_id": {"type": "integer", "description": "The calendar ID of the doctor."},
                                 "slot_iso": {"type": "string", "description": "The exact ISO datetime slot chosen by the patient."},
-                                "patient_first_name": {"type": "string"},
-                                "patient_last_name": {"type": "string"},
+                                "patient_first_name": {"type": "string", "description": "Patient first name in Latin characters only. Transliterate from Arabic, Chinese, Cyrillic, etc. before calling."},
+                                "patient_last_name": {"type": "string", "description": "Patient last name in Latin characters only. Transliterate from Arabic, Chinese, Cyrillic, etc. before calling."},
                                 "patient_dob": {"type": "string", "description": "Patient's Date of Birth in YYYY-MM-DD format."},
                                 "patient_phone": {"type": "string", "description": "Patient's phone number with country code (e.g. +41...)"},
                                 "patient_gender": {"type": "string", "enum": ["male", "female", "other"], "description": "Patient's gender. Detect automatically from the caller's voice (male vs female voice characteristics). Do NOT ask the patient. Use 'male' for clearly male voices, 'female' for clearly female voices, 'other' only when voice is completely ambiguous."},

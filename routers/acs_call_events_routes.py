@@ -236,11 +236,9 @@ async def handle_callback(contextId: str, request: Request):
                 )
 
                 # Guard: skip if WebSocket handler already started cleanup for this session
-                if contextId in session_manager._cleanup_in_progress:
+                if not await session_manager.begin_cleanup(contextId):
                     logger.info(f"[CALLBACK] Session {contextId[:8]} cleanup already in progress — skipping")
                 else:
-                    session_manager._cleanup_in_progress.add(contextId)
-
                     # Send transcript email
                     try:
                         await session_manager.send_transcript_email(
@@ -279,6 +277,17 @@ async def websocket_handler_acs(websocket: WebSocket):
     current_session_id = websocket.query_params.get("session_id")
     if not current_session_id:
         logger.warning("WebSocket connected without session_id!")
+
+    realtime_reserved = await session_manager.begin_realtime_session(current_session_id)
+    if not realtime_reserved:
+        logger.warning(
+            f"[WS] Duplicate realtime bridge for session {current_session_id[:8]} — closing"
+        )
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        return
     
     try:
         # Add a timeout to prevent hanging connections
@@ -298,11 +307,11 @@ async def websocket_handler_acs(websocket: WebSocket):
             await websocket.close()
         except:
             pass
+        await session_manager.end_realtime_session(current_session_id)
         # Safety-net cleanup: if CallDisconnected hasn't already handled this session,
         # send transcript email and end the session so it doesn't linger forever.
         if current_session_id and current_session_id in session_manager.active_sessions:
-            if current_session_id not in session_manager._cleanup_in_progress:
-                session_manager._cleanup_in_progress.add(current_session_id)
+            if await session_manager.begin_cleanup(current_session_id):
                 logger.info(f"[WS CLEANUP] Session {current_session_id[:8]} still active — cleaning up")
                 try:
                     _sess = session_manager.active_sessions.get(current_session_id)
