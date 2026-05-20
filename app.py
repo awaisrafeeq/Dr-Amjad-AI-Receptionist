@@ -1,15 +1,38 @@
 import os
 import logging
 import sys
+import importlib.util
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
 import uvicorn
-from routers import (acs_call_events_router, document_router, appointments_router)
 from contextlib import asynccontextmanager
 
 from utils.session_manager import session_manager
+
+
+def _load_router_module(module_name: str):
+    module_path = os.path.join(APP_DIR, "routers", f"{module_name}.py")
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load router module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    from routers import (acs_call_events_router, document_router, appointments_router)
+except ModuleNotFoundError:
+    acs_call_events_router = _load_router_module("acs_call_events_routes").router
+    document_router = _load_router_module("document_routes").router
+    appointments_router = _load_router_module("appointments_routes").router
 
 
 # Setup logging to both console and file

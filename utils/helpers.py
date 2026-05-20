@@ -34,9 +34,9 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                 "output_audio_format": "pcm16",
                 "turn_detection": {
                     "type": 'server_vad',
-                    "threshold": 0.9,
+                    "threshold": 0.8,
                     "prefix_padding_ms": 200,
-                    "silence_duration_ms": 1200
+                    "silence_duration_ms": 800
                 },
                 "input_audio_transcription": {
                   "model": "gpt-4o-transcribe",

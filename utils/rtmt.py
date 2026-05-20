@@ -83,7 +83,7 @@ class RTMiddleTier:
         self.api_version = config["azure_openai_api_version"]
         self.key = config["azure_openai_key"]
 
-        self.selected_voice = "shimmer"
+        self.selected_voice = "coral"
         self._prompt_path = "system_prompt.md"
         self._prompt_mtime: float = 0.0
         self.system_message = self._load_prompt()
@@ -154,7 +154,7 @@ class RTMiddleTier:
 
                     last_user_activity_ts = loop.time()
                     last_prompt_stage = 0
-                    detected_conversation_language: Optional[str] = None
+                    detected_conversation_language: Optional[str] = "de"
 
                     last_kb_context: Optional[str] = None
 
@@ -200,6 +200,12 @@ class RTMiddleTier:
                             return None
                         _sess = session_manager.active_sessions.get(session_id)
                         return _sess.phonebook_match if _sess else None
+
+                    def _language_instruction() -> str:
+                        _lang = detected_conversation_language or "de"
+                        if _lang == "en":
+                            return "Respond only in English. Do not mix German words into the sentence. "
+                        return "Respond only in German. Do not mix English words into the sentence. "
 
                     async def send_assistant_prompt(instructions: str) -> None:
                         nonlocal response_active
@@ -387,7 +393,7 @@ class RTMiddleTier:
 
                         # Silence policy (seconds). Keep early prompts short so callers
                         # know the line is still active during pauses or weak audio.
-                        prompt_1_after = 12
+                        prompt_1_after = 10
                         prompt_2_after = 30
                         hangup_after = 150
 
@@ -415,8 +421,7 @@ class RTMiddleTier:
 
                                 idle_for = loop.time() - last_user_activity_ts
 
-                                _lang = detected_conversation_language or "de"
-                                _lang_instruction = f"Respond in the language the caller is speaking (currently '{_lang}'). "
+                                _lang_instruction = _language_instruction()
 
                                 if idle_for >= hangup_after and last_prompt_stage < 3:
                                     last_prompt_stage = 3
@@ -571,17 +576,31 @@ class RTMiddleTier:
                                         # unblocked — audio frames from OpenAI continue to be forwarded
                                         # to ACS while the function executes, eliminating silence gaps.
                                         _slow_function_prompts = {
-                                            "get_available_doctors": "I am checking the available doctors, please wait a moment.",
-                                            "get_available_slots": "I am still checking the appointment availability, please wait a moment.",
-                                            "get_next_available_slot": "I am still looking for the next available appointment, please wait a moment.",
-                                            "book_appointment": "I am booking your appointment, please wait a moment.",
+                                            "get_available_doctors": {
+                                                "en": "I am checking the available doctors, please wait a moment.",
+                                                "de": "Ich pruefe die verfuegbaren Aerzte, bitte warten Sie einen Moment.",
+                                            },
+                                            "get_available_slots": {
+                                                "en": "I am still checking the appointment availability, please wait a moment.",
+                                                "de": "Ich pruefe noch die Terminverfuegbarkeit, bitte warten Sie einen Moment.",
+                                            },
+                                            "get_next_available_slot": {
+                                                "en": "I am still looking for the next available appointment, please wait a moment.",
+                                                "de": "Ich suche noch den naechsten verfuegbaren Termin, bitte warten Sie einen Moment.",
+                                            },
+                                            "book_appointment": {
+                                                "en": "I am booking your appointment, please wait a moment.",
+                                                "de": "Ich buche Ihren Termin, bitte warten Sie einen Moment.",
+                                            },
                                         }
 
                                         async def _send_tool_holding_prompt(_func_name: str, *, keepalive: bool = False):
                                             nonlocal response_active
-                                            _message = _slow_function_prompts.get(_func_name)
-                                            if not _message or call_end_requested.is_set():
+                                            _messages = _slow_function_prompts.get(_func_name)
+                                            if not _messages or call_end_requested.is_set():
                                                 return
+                                            _lang = detected_conversation_language or "de"
+                                            _message = _messages.get(_lang, _messages["de"])
 
                                             try:
                                                 if response_active:
@@ -597,8 +616,8 @@ class RTMiddleTier:
                                                         "tool_choice": "none",
                                                         "max_output_tokens": 45,
                                                         "instructions": (
-                                                            f"Say EXACTLY ONE short sentence: '{_message}' "
-                                                            f"in the language the caller is speaking (currently '{detected_conversation_language or 'de'}'). "
+                                                            f"{_language_instruction()}"
+                                                            f"Say EXACTLY this one short sentence: '{_message}' "
                                                             "Then STOP. Say NOTHING else. Do NOT list anything. Do NOT guess results."
                                                         )
                                                     }
@@ -1413,8 +1432,9 @@ class RTMiddleTier:
                                                 except Exception as e:
                                                     logger.error(f"[TRANSCRIPT ERROR] {e}")
 
-                                            # Detect language from BOTH agent and customer responses
-                                            if transcription_data.get("speaker") in ("agent", "customer"):
+                                            # Detect language from the caller only. Agent greeting/holding
+                                            # prompts should not flip the conversation language.
+                                            if transcription_data.get("speaker") == "customer":
                                                 text = transcription_data.get("utterance_text", "").strip().lower()
                                                 # Check for explicit language switch phrases first
                                                 if any(phrase in text for phrase in ["speak english", "in english", "switch to english", "we can speak english"]):
