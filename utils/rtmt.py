@@ -23,6 +23,8 @@ from utils.session_manager import session_manager
 from utils.document_utils import document_processor
 from utils.epaad_client import epaad_client
 from utils.availability import build_next_available_recommendation, build_slot_recommendation, compute_free_slots, default_opening_hours
+from utils.call_safety import CallSafetyState, ValidationResult
+from utils.ai_safety_judge import ai_safety_judge
 
 try:
     from langdetect import detect as detect_lang
@@ -163,6 +165,7 @@ class RTMiddleTier:
                     response_active = False
                     hangup_sent = False  # Guard against double hangup
                     _dynamic_tasks: list = []  # tracks fire-and-forget tasks for cleanup
+                    safety_state = CallSafetyState()
 
                     # Per-session doctor validation: get_available_slots is blocked
                     # until get_available_doctors has been called and returned valid IDs.
@@ -201,11 +204,37 @@ class RTMiddleTier:
                         _sess = session_manager.active_sessions.get(session_id)
                         return _sess.phonebook_match if _sess else None
 
+                    async def ensure_session_available(reason: str) -> bool:
+                        """Reload active session state if the app restarted mid-call."""
+                        if not session_id:
+                            return False
+                        if session_id in session_manager.active_sessions:
+                            return True
+                        restored = await session_manager.restore_session(session_id)
+                        if restored:
+                            logger.warning(
+                                f"[SESSION RESTORE] Restored session {session_id[:8]} during {reason}"
+                            )
+                            return True
+                        logger.warning(
+                            f"[SESSION RESTORE] Unable to restore session {session_id[:8]} during {reason}"
+                        )
+                        return False
+
                     def _language_instruction() -> str:
                         _lang = detected_conversation_language or "de"
-                        if _lang == "en":
-                            return "Respond only in English. Do not mix German words into the sentence. "
-                        return "Respond only in German. Do not mix English words into the sentence. "
+                        _names = {
+                            "de": "German",
+                            "en": "English",
+                            "fr": "French",
+                            "it": "Italian",
+                            "es": "Spanish",
+                            "tr": "Turkish",
+                            "ar": "Arabic",
+                            "ku": "Kurdish",
+                        }
+                        _name = _names.get(_lang, "German")
+                        return f"Respond only in {_name}. Do not mix languages in the sentence. "
 
                     async def send_assistant_prompt(instructions: str) -> None:
                         nonlocal response_active
@@ -232,6 +261,105 @@ class RTMiddleTier:
                         except Exception:
                             logger.exception("Failed to send response.create")
 
+                    async def maybe_send_escalation(reason: str) -> None:
+                        if safety_state.escalation_sent or not session_id:
+                            return
+                        safety_state.escalation_sent = True
+                        try:
+                            await session_manager.send_escalation_email(
+                                session_id=session_id,
+                                reason=reason,
+                                action="Please review this call and contact the caller if follow-up is required.",
+                            )
+                        except Exception as exc:
+                            logger.warning(f"[SAFETY] Escalation email failed: {exc}")
+
+                    async def log_safety_decision(decision: Optional[Dict[str, Any]], action: Optional[str]) -> None:
+                        if not session_id or not decision:
+                            return
+                        try:
+                            await session_manager.log_event(
+                                session_id=session_id,
+                                event_data={
+                                    "event_type": "SafetyJudge",
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "action": action,
+                                    "decision": decision,
+                                    "unclear_count": safety_state.unclear_count,
+                                    "weak_turn_count": safety_state.weak_turn_count,
+                                    "human_request_count": safety_state.human_request_count,
+                                    "workflow_blocked": safety_state.workflow_blocked,
+                                    "workflow_block_reason": safety_state.workflow_block_reason,
+                                },
+                            )
+                        except Exception as exc:
+                            logger.debug(f"[AI SAFETY] Failed to log decision: {exc}")
+
+                    async def log_tool_audit(
+                        tool_name: str,
+                        stage: str,
+                        args: Optional[Dict[str, Any]] = None,
+                        validation: Optional[Any] = None,
+                        result: Optional[str] = None,
+                    ) -> None:
+                        """Persist a compact internal audit trail for high-risk tool calls."""
+                        if not session_id:
+                            return
+
+                        args = args or {}
+                        critical_fields = (
+                            "patient_first_name",
+                            "patient_last_name",
+                            "patient_dob",
+                            "patient_phone",
+                            "patient_email",
+                            "slot_iso",
+                            "calendar_id",
+                            "visit_reason",
+                        )
+                        field_presence = {
+                            key: bool(str(args.get(key) or "").strip())
+                            for key in critical_fields
+                            if key in args
+                        }
+
+                        result_status = None
+                        if result:
+                            try:
+                                parsed = json.loads(result)
+                                if isinstance(parsed, dict):
+                                    result_status = parsed.get("status") or parsed.get("error")
+                            except Exception:
+                                result_status = result[:80]
+
+                        event_data = {
+                            "event_type": "ToolAudit",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "tool_name": tool_name,
+                            "stage": stage,
+                            "identity_resolved": safety_state.identity_resolved,
+                            "has_phonebook_match": bool(_resolved_phonebook_match()),
+                            "workflow_blocked": safety_state.workflow_blocked,
+                            "workflow_block_reason": safety_state.workflow_block_reason,
+                            "unclear_count": safety_state.unclear_count,
+                            "weak_turn_count": safety_state.weak_turn_count,
+                            "human_request_count": safety_state.human_request_count,
+                            "recent_customer_texts": safety_state.recent_customer_texts[-3:],
+                            "field_presence": field_presence,
+                            "calendar_id": args.get("calendar_id"),
+                            "slot_iso": args.get("slot_iso"),
+                            "validation_allowed": getattr(validation, "allowed", None),
+                            "validation_reason": getattr(validation, "reason", ""),
+                            "validation_source": getattr(validation, "source", ""),
+                            "validation_confidence": getattr(validation, "confidence", None),
+                            "result_status": result_status,
+                        }
+
+                        try:
+                            await session_manager.log_event(session_id=session_id, event_data=event_data)
+                        except Exception as exc:
+                            logger.debug(f"[TOOL AUDIT] Failed to log {tool_name}/{stage}: {exc}")
+
                     async def _do_acs_hangup(reason: str) -> bool:
                         """Centralized ACS hangup with full diagnostic logging.
                         Returns True if hangup was sent, False otherwise."""
@@ -247,6 +375,8 @@ class RTMiddleTier:
                             return False
 
                         _sess = session_manager.active_sessions.get(session_id)
+                        if not _sess:
+                            _sess = await session_manager.restore_session(session_id)
                         if not _sess:
                             logger.error(f"{_tag} FAILED — session {session_id[:8]} not found in active_sessions")
                             return False
@@ -314,7 +444,8 @@ class RTMiddleTier:
                         # If session_id is known but NOT in active_sessions, the app restarted mid-call.
                         # ACS reconnected to the new instance — do NOT send another greeting.
                         if session_id and session_id not in session_manager.active_sessions:
-                            logger.warning(f"[GREETING] Skipping — session {session_id[:8]} not in memory (app restart reconnect)")
+                            await ensure_session_available("greeting")
+                            logger.warning(f"[GREETING] Skipping duplicate greeting after reconnect for session {session_id[:8]}")
                             greeting_sent.set()
                             return
 
@@ -401,20 +532,12 @@ class RTMiddleTier:
                             while not call_end_requested.is_set():
                                 await asyncio.sleep(1.0)
 
-                                # Detect externally ended session (e.g. CallDisconnected
-                                # arrived before the WS closed — the "ghost session" case).
-                                # Close the OpenAI WS so the forward loop exits cleanly.
+                                # After app restart, active_sessions starts empty while
+                                # ACS can still reconnect media for an active call. Try
+                                # restoring state instead of closing the bridge, otherwise
+                                # the caller hears silence.
                                 if session_id and session_id not in session_manager.active_sessions:
-                                    logger.warning(
-                                        f"[GHOST SESSION] Session {session_id[:8]} no longer in active_sessions "
-                                        f"— closing OpenAI WebSocket to stop ghost processing"
-                                    )
-                                    call_end_requested.set()
-                                    try:
-                                        await target_ws.close()
-                                    except Exception:
-                                        pass
-                                    return
+                                    await ensure_session_available("inactivity_monitor")
 
                                 if not greeting_sent.is_set():
                                     continue
@@ -645,9 +768,43 @@ class RTMiddleTier:
                                             _result = ""
                                             _holding_stop = asyncio.Event()
                                             _holding_task = None
+                                            _validation = safety_state.validate_tool_call(
+                                                _func_name,
+                                                _args or {},
+                                                has_phonebook_match=bool(_resolved_phonebook_match()),
+                                            )
+                                            if _validation.allowed and _func_name in {
+                                                "resolve_phonebook_identity",
+                                                "get_available_doctors",
+                                                "get_available_slots",
+                                                "get_next_available_slot",
+                                                "book_appointment",
+                                            }:
+                                                _ai_validation = await ai_safety_judge.validate_tool_call(
+                                                    tool_name=_func_name,
+                                                    args=_args or {},
+                                                    recent_customer_texts=safety_state.recent_customer_texts,
+                                                    identity_resolved=safety_state.identity_resolved,
+                                                    has_phonebook_match=bool(_resolved_phonebook_match()),
+                                                    workflow_blocked=safety_state.workflow_blocked,
+                                                )
+                                                if _ai_validation and not _ai_validation.allowed:
+                                                    _validation = ValidationResult(
+                                                        False,
+                                                        _ai_validation.reason or "ai_tool_validator_blocked",
+                                                        _ai_validation.message or "Ask one short clarification question before continuing.",
+                                                        confidence=_ai_validation.confidence,
+                                                        source="ai_safety_judge",
+                                                    )
+                                            await log_tool_audit(
+                                                _func_name,
+                                                "requested",
+                                                _args,
+                                                validation=_validation,
+                                            )
 
                                             # Send brief holding message for slow functions so caller never hears silence
-                                            if _func_name in _slow_function_prompts:
+                                            if _validation.allowed and _func_name in _slow_function_prompts:
                                                 await _send_tool_holding_prompt(_func_name)
                                                 _holding_task = asyncio.create_task(_tool_keepalive_loop(_func_name, _holding_stop))
                                                 _dynamic_tasks.append(_holding_task)
@@ -659,7 +816,22 @@ class RTMiddleTier:
                                                     _session_calendars = await epaad_client.get_calendars()
                                                 return _session_calendars
 
-                                            if _func_name == "resolve_phonebook_identity":
+                                            if not _validation.allowed:
+                                                logger.warning(
+                                                    "[TOOL BLOCKED] %s session=%s reason=%s args=%s",
+                                                    _func_name,
+                                                    session_id,
+                                                    _validation.reason,
+                                                    _args,
+                                                )
+                                                _result = _json_dumps({
+                                                    "status": "clarification_required",
+                                                    "error": _validation.reason,
+                                                    "message": _validation.message,
+                                                    "instruction": "Ask exactly one short clarification question. Do not call another tool until the caller clearly answers.",
+                                                })
+
+                                            elif _func_name == "resolve_phonebook_identity":
                                                 try:
                                                     __first = (_args.get("patient_first_name") or "").strip()
                                                     __last = (_args.get("patient_last_name") or "").strip()
@@ -681,6 +853,7 @@ class RTMiddleTier:
                                                         first_name=__first,
                                                         last_name=__last,
                                                     )
+                                                    safety_state.identity_resolved = True
                                                     logger.info(
                                                         "[PHONEBOOK] Identity resolution session=%s matched=%s candidate_count=%s",
                                                         session_id,
@@ -1313,6 +1486,14 @@ class RTMiddleTier:
                                             if _holding_task and not _holding_task.done():
                                                 _holding_task.cancel()
 
+                                            await log_tool_audit(
+                                                _func_name,
+                                                "completed",
+                                                _args,
+                                                validation=_validation,
+                                                result=_result,
+                                            )
+
                                             # Cancel any still-active holding response before sending tool output.
                                             # This prevents the AI from saying "no slots available" (guess)
                                             # then "actually I see slots" (real data) — the contradiction problem.
@@ -1432,29 +1613,89 @@ class RTMiddleTier:
                                                 except Exception as e:
                                                     logger.error(f"[TRANSCRIPT ERROR] {e}")
 
-                                            # Detect language from the caller only. Agent greeting/holding
-                                            # prompts should not flip the conversation language.
-                                            if transcription_data.get("speaker") == "customer":
-                                                text = transcription_data.get("utterance_text", "").strip().lower()
-                                                # Check for explicit language switch phrases first
-                                                if any(phrase in text for phrase in ["speak english", "in english", "switch to english", "we can speak english"]):
-                                                    if detected_conversation_language != "en":
-                                                        detected_conversation_language = "en"
-                                                        logger.info(f"[LANG] Explicit switch to English detected from {transcription_data.get('speaker')}")
-                                                # Also detect from German phrases
-                                                elif any(phrase in text for phrase in ["deutsch", "auf deutsch", "auf deutsch sprechen"]):
-                                                    if detected_conversation_language != "de":
-                                                        detected_conversation_language = "de"
-                                                        logger.info(f"[LANG] Explicit switch to German detected from {transcription_data.get('speaker')}")
-                                                # Fall back to langdetect for longer utterances (increased from 15 to 30)
-                                                elif detect_lang and len(text) > 30:
-                                                    try:
-                                                        _lang = await asyncio.to_thread(detect_lang, text)
-                                                        if _lang and _lang in ("en", "de") and _lang != detected_conversation_language:
-                                                            detected_conversation_language = _lang
-                                                            logger.debug(f"[LANG] Detected from {transcription_data.get('speaker')}: {_lang}")
-                                                    except Exception:
-                                                        pass
+                                            _speaker = transcription_data.get("speaker", "unknown")
+                                            _utterance = transcription_data.get("utterance_text", "")
+                                            safety_state.record_transcript(_speaker, _utterance)
+                                            _safety_decision = None
+                                            _safety_event = None
+                                            if _speaker == "customer":
+                                                _judged = await ai_safety_judge.classify_turn(
+                                                    utterance=_utterance,
+                                                    language=detected_conversation_language or "de",
+                                                    recent_customer_texts=safety_state.recent_customer_texts,
+                                                    last_agent_text=safety_state.last_agent_text,
+                                                )
+                                                if _judged:
+                                                    _safety_decision = _judged.to_dict()
+                                                    _requested_language = str(_safety_decision.get("requested_language") or "").lower()
+                                                    if _requested_language in {"de", "en", "fr", "it", "es", "tr", "ar", "ku"}:
+                                                        if _requested_language != detected_conversation_language:
+                                                            detected_conversation_language = _requested_language
+                                                            logger.info(
+                                                                f"[LANG] AI judge detected explicit language request: {_requested_language}"
+                                                            )
+                                                    _safety_event = safety_state.apply_ai_decision(_safety_decision)
+                                                    await log_safety_decision(_safety_decision, _safety_event)
+
+                                            if _speaker == "customer" and _safety_event == "emergency":
+                                                reason = safety_state.workflow_block_reason or "Emergency red flag detected."
+                                                logger.warning(f"[SAFETY] {reason} session={session_id}")
+                                                await maybe_send_escalation(reason)
+                                                await send_assistant_prompt(
+                                                    f"{_language_instruction()}"
+                                                    "Say one calm emergency instruction only: if this is an emergency, the caller should hang up now and call emergency services or the medical emergency service at 061 261 15 15. "
+                                                    "Then say the practice team will be informed. Do not continue booking."
+                                                )
+
+                                            elif _speaker == "customer" and _safety_event == "quality_threshold":
+                                                reason = safety_state.workflow_block_reason or "Conversation quality threshold reached."
+                                                logger.warning(f"[SAFETY] {reason} session={session_id}")
+                                                await maybe_send_escalation(reason)
+                                                await send_assistant_prompt(
+                                                    f"{_language_instruction()}"
+                                                    "Tell the caller briefly that you are having trouble understanding clearly, "
+                                                    "so you will forward the request to the practice team for review. Do not continue booking."
+                                                )
+
+                                            elif _speaker == "customer" and _safety_event == "unclear_input":
+                                                if safety_state.unclear_count <= 2:
+                                                    logger.info(
+                                                        f"[SAFETY] Unclear caller input ({safety_state.unclear_count}/3): {_utterance[:80]!r}"
+                                                    )
+                                                    await send_assistant_prompt(
+                                                        f"{_language_instruction()}"
+                                                        "Say one short sentence that you did not understand clearly, "
+                                                        "then ask the caller to repeat the same answer. Do not guess."
+                                                    )
+                                                else:
+                                                    reason = "Caller input remained unclear after repeated attempts."
+                                                    logger.warning(f"[SAFETY] {reason} session={session_id}")
+                                                    await maybe_send_escalation(reason)
+                                                    await send_assistant_prompt(
+                                                        f"{_language_instruction()}"
+                                                        "Tell the caller briefly that you will forward this to the practice team for review. "
+                                                        "Do not continue booking."
+                                                    )
+
+                                            elif _speaker == "customer" and _safety_event == "human_requested":
+                                                if safety_state.human_request_count >= 2:
+                                                    reason = "Caller requested human assistance more than once."
+                                                    logger.info(f"[SAFETY] {reason} session={session_id}")
+                                                    await maybe_send_escalation(reason)
+                                                    await send_assistant_prompt(
+                                                        f"{_language_instruction()}"
+                                                        "Tell the caller that you cannot directly transfer the call, "
+                                                        "but you will send a message to the practice team. Ask for the reason in one short question."
+                                                    )
+                                                else:
+                                                    await send_assistant_prompt(
+                                                        f"{_language_instruction()}"
+                                                        "Tell the caller that you cannot directly transfer the call, "
+                                                        "but you can send a message to the practice team. Ask what the message is about."
+                                                    )
+
+                                            # Language switching is handled by the AI safety judge using
+                                            # explicit requested_language signals, not phrase matching.
                                     except Exception as e:
                                         logger.debug(f"Transcription processing error: {e}")
                                     
@@ -1524,11 +1765,19 @@ class RTMiddleTier:
                             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                                 logger.warning("[TRANSCRIPT] Flush task did not finish during cleanup")
 
-                        # Ensure the ACS call is hung up so CallDisconnected event fires
-                        logger.info(f"[CLEANUP] Forward loop ended — ensuring ACS call is hung up. session={session_id}, call_end_requested={call_end_requested.is_set()}")
-                        _hung = await _do_acs_hangup("forward_loop_cleanup")
-                        if not _hung:
-                            logger.warning("[CLEANUP] Cleanup hangup returned False — call may already be disconnected or session missing")
+                        # Do not hang up on an unexpected media bridge close. ACS may
+                        # briefly open/close duplicate websocket attempts; hanging up
+                        # here can turn a recoverable bridge issue into a dropped call.
+                        logger.info(
+                            f"[CLEANUP] Forward loop ended. session={session_id}, "
+                            f"call_end_requested={call_end_requested.is_set()}"
+                        )
+                        if call_end_requested.is_set():
+                            _hung = await _do_acs_hangup("forward_loop_cleanup")
+                            if not _hung:
+                                logger.warning("[CLEANUP] Cleanup hangup returned False — call may already be disconnected or session missing")
+                        else:
+                            logger.warning("[CLEANUP] Skipping automatic hangup after unexpected websocket close")
 
                     except asyncio.CancelledError:
                         logger.debug("Forward messages cancelled")

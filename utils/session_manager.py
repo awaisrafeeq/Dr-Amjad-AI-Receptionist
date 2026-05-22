@@ -216,6 +216,75 @@ class SessionManager:
             async with self._session_lock:
                 self.active_sessions.pop(session_id, None)
             raise
+
+    async def restore_session(self, session_id: Optional[str]) -> Optional[CallSession]:
+        """Restore a session from persisted metadata after an app restart."""
+        if not session_id:
+            return None
+
+        async with self._session_lock:
+            existing = self.active_sessions.get(session_id)
+            if existing:
+                return existing
+
+        metadata = await storage_logger.get_call_metadata(session_id)
+        if not metadata:
+            return None
+
+        stored_status = (metadata.get("status") or "").lower()
+        if stored_status in {"disconnected", "completed", "failed"}:
+            logger.info(
+                f"[SESSION] Not restoring ended session {session_id[:8]} status={stored_status}"
+            )
+            return None
+
+        def _parse_datetime(value: Any) -> datetime:
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, str) and value:
+                try:
+                    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError:
+                    pass
+            return datetime.now(timezone.utc)
+
+        phonebook_candidates: List[Dict[str, Any]] = []
+        try:
+            participants = metadata.get("participants") or []
+            caller_phone = participants[0].get("phone_number") if participants else None
+            lookup = get_phonebook_lookup()
+            if lookup is not None and caller_phone:
+                phonebook_candidates = [
+                    match.to_dict() for match in lookup.lookup_candidates_by_phone(caller_phone)
+                ]
+        except Exception as e:
+            logger.warning("Phonebook restore lookup failed (internal only): %s", e)
+
+        session = CallSession(
+            session_id=session_id,
+            history_id=metadata.get("history_id") or str(uuid4()),
+            start_time=_parse_datetime(metadata.get("start_time")),
+            participants=metadata.get("participants") or [],
+            direction=metadata.get("direction") or "inbound",
+            platform=metadata.get("platform") or "Azure Communication Services",
+            status=metadata.get("status") or "active",
+            end_time=_parse_datetime(metadata.get("end_time")) if metadata.get("end_time") else None,
+            total_duration=metadata.get("total_duration") or 0.0,
+            call_connection_id=metadata.get("CallConnectionId") or metadata.get("callConnectionId"),
+            server_call_id=metadata.get("ServerCallId") or metadata.get("serverCallId"),
+            correlation_id=metadata.get("CorrelationId") or metadata.get("correlationId"),
+            transcription_count=metadata.get("total_transcriptions") or 0,
+            phonebook_candidates=phonebook_candidates,
+        )
+
+        async with self._session_lock:
+            self.active_sessions[session_id] = session
+
+        logger.warning(
+            f"[SESSION] Restored from storage after restart: {session_id[:8]} "
+            f"status={session.status}, call_connection_id={session.call_connection_id}"
+        )
+        return session
             
     async def end_session(self, session_id: Optional[str] = None, event_data: Optional[Dict[str, Any]] = None):
         """
@@ -231,11 +300,15 @@ class SessionManager:
         try:
                 
             async with self._session_lock:
-                if not session_id or session_id not in self.active_sessions:
-                    logger.warning(f"[SESSION] Not found: {session_id}")
-                    self._cleanup_in_progress.discard(session_id)
-                    return False
-                session = self.active_sessions[session_id]
+                session = self.active_sessions.get(session_id) if session_id else None
+
+            if not session and session_id:
+                session = await self.restore_session(session_id)
+
+            if not session:
+                logger.warning(f"[SESSION] Not found: {session_id}")
+                self._cleanup_in_progress.discard(session_id)
+                return False
             
             if event_data is not None:
                 end_time_str = event_data.get("timestamp", datetime.now(timezone.utc))
@@ -325,6 +398,9 @@ class SessionManager:
             
             async with self._session_lock:
                 session_data = self.active_sessions.get(session_id)
+
+            if not session_data:
+                session_data = await self.restore_session(session_id)
             
             if event_data is not None:
                 
@@ -345,6 +421,29 @@ class SessionManager:
                 if session_data and event_data.get('status') != session_data.status:
                     if session_data:
                         session_data.status = event_data.get('status', session_data.status)
+
+                if session_data and any(
+                    key in event_data for key in ("callConnectionId", "serverCallId", "correlationId")
+                ):
+                    try:
+                        await storage_logger.log_call_metadata({
+                            'id': session_id,
+                            'sessionId': session_id,
+                            'history_id': session_data.history_id,
+                            'start_time': session_data.start_time.isoformat(),
+                            'end_time': session_data.end_time.isoformat() if session_data.end_time else None,
+                            'total_duration': session_data.total_duration,
+                            'CallConnectionId': session_data.call_connection_id,
+                            'ServerCallId': session_data.server_call_id,
+                            'CorrelationId': session_data.correlation_id,
+                            'direction': session_data.direction,
+                            'participants': session_data.participants,
+                            'total_transcriptions': session_data.transcription_count,
+                            'platform': session_data.platform,
+                            'status': session_data.status,
+                        })
+                    except Exception as metadata_error:
+                        logger.warning(f"[SESSION] Metadata refresh skipped: {metadata_error}")
                     
                 
                 # 'participants': metadata_doc['participants'],
@@ -494,6 +593,42 @@ class SessionManager:
             
         except Exception as e:
             logger.error(f"[EMAIL] Error: {e}")
+            return False
+
+    async def send_escalation_email(
+        self,
+        session_id: str,
+        reason: str,
+        caller_phone: Optional[str] = None,
+        action: str = "Please review the transcript and call the patient back if needed.",
+    ) -> bool:
+        """Send a staff action email without ending the session."""
+        try:
+            from utils.email_service import email_service
+
+            if not session_id:
+                return False
+
+            transcript_data = await storage_logger.get_transcriptions_for_session(session_id)
+            session = self.active_sessions.get(session_id)
+            if caller_phone is None and session and session.participants:
+                caller_phone = session.participants[0].get("phone_number")
+
+            caller_info = {"phone": caller_phone} if caller_phone else None
+            success = await email_service.send_escalation_email(
+                session_id=session_id,
+                transcript_data=transcript_data or [],
+                caller_info=caller_info,
+                reason=reason,
+                action=action,
+            )
+            if success:
+                logger.info(f"[ESCALATION EMAIL] Sent for {session_id}: {reason}")
+            else:
+                logger.error(f"[ESCALATION EMAIL] Failed for {session_id}: {reason}")
+            return success
+        except Exception as e:
+            logger.error(f"[ESCALATION EMAIL] Error: {e}")
             return False
         
     def get_session_phonebook_info(self, session_id: str) -> Optional[Dict[str, Any]]:

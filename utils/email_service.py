@@ -242,6 +242,73 @@ Please review for accuracy and follow up as needed.
             logger.error(f"Error sending transcript email: {e}")
             return False
 
+    async def send_escalation_email(
+        self,
+        session_id: str,
+        transcript_data: List[Dict[str, Any]],
+        caller_info: Optional[Dict[str, str]] = None,
+        reason: str = "AI call needs staff review",
+        action: str = "Please review the transcript and call the patient back if needed.",
+        recipient: Optional[str] = None,
+    ) -> bool:
+        """Send a concise staff action email for incomplete or unsafe calls."""
+        try:
+            recipients = self._parse_recipients(recipient or self.default_recipient)
+            if not recipients:
+                logger.error("No email recipients configured. Set EMAIL_DEFAULT_RECIPIENT.")
+                return False
+
+            caller_phone = caller_info.get("phone", "Unknown") if caller_info else "Unknown"
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            transcript_html = self._format_transcript_html(transcript_data)
+            transcript_text = self._format_transcript_text(transcript_data)
+            subject = f"Action required: AI call review - {caller_phone} - {timestamp}"
+
+            html_body = f"""
+            <html>
+            <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+                <h2 style="color: #b45309;">MedCenter Volta - Action Required</h2>
+                <div style="background-color: #fff7ed; padding: 15px; border-left: 4px solid #f59e0b; margin-bottom: 20px;">
+                    <strong>Reason:</strong> {html.escape(reason)}<br>
+                    <strong>Requested action:</strong> {html.escape(action)}<br>
+                    <strong>Caller:</strong> {html.escape(caller_phone)}<br>
+                    <strong>Session ID:</strong> {html.escape(session_id)}<br>
+                    <strong>Date:</strong> {html.escape(timestamp)}
+                </div>
+                <h3 style="color: #2c5aa0;">Conversation Transcript:</h3>
+                <div style="border-left: 3px solid #2c5aa0; padding-left: 15px;">
+                    {transcript_html}
+                </div>
+            </body>
+            </html>
+            """
+
+            text_body = f"""MedCenter Volta - Action Required
+
+Reason: {reason}
+Requested action: {action}
+Caller: {caller_phone}
+Session ID: {session_id}
+Date: {timestamp}
+
+--- Conversation Transcript ---
+
+{transcript_text}
+"""
+
+            if self.connection_string:
+                if await self._send_via_acs_email(recipients, subject, html_body, text_body):
+                    return True
+            if self.sendgrid_api_key:
+                if await self._send_via_sendgrid(recipients, subject, html_body, text_body):
+                    return True
+
+            logger.error("No email service configured. Set ACS_EMAIL_CONNECTION_STRING or SENDGRID_API_KEY.")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending escalation email: {e}")
+            return False
+
     async def _build_german_summary(self, transcript_data: List[Dict[str, Any]], transcript_text: str) -> str:
         """Create a medium-length German paragraph summary for the transcript email."""
         llm_summary = await self._generate_german_summary_with_llm(transcript_text)

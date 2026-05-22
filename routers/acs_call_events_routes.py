@@ -308,13 +308,20 @@ async def websocket_handler_acs(websocket: WebSocket):
         except:
             pass
         await session_manager.end_realtime_session(current_session_id)
-        # Safety-net cleanup: if CallDisconnected hasn't already handled this session,
-        # send transcript email and end the session so it doesn't linger forever.
+        # ACS CallDisconnected is the source of truth for ending a call. A websocket
+        # can close because ACS retried/duplicated the media bridge, so do not end
+        # an otherwise active session here.
         if current_session_id and current_session_id in session_manager.active_sessions:
+            _sess = session_manager.active_sessions.get(current_session_id)
+            if _sess and _sess.status not in ("disconnected", "completed", "failed"):
+                logger.warning(
+                    f"[WS CLEANUP] Session {current_session_id[:8]} websocket closed while status={_sess.status}; "
+                    "waiting for ACS CallDisconnected"
+                )
+                return
             if await session_manager.begin_cleanup(current_session_id):
                 logger.info(f"[WS CLEANUP] Session {current_session_id[:8]} still active — cleaning up")
                 try:
-                    _sess = session_manager.active_sessions.get(current_session_id)
                     _caller_phone = (
                         _sess.participants[0]["phone_number"]
                         if _sess and _sess.participants else None

@@ -138,6 +138,22 @@ class AzureStorageLogger:
         except Exception as e:
             logger.error(f"Error logging call metadata: {e}")
             raise
+
+    async def get_call_metadata(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve call metadata by session id.
+
+        Used to restore in-memory session state after an app restart while ACS
+        still has the call connected.
+        """
+        try:
+            container = await self.get_container('call_metadata')
+            return await container.read_item(item=session_id, partition_key=session_id)
+        except exceptions.CosmosResourceNotFoundError:
+            logger.warning(f"Call metadata not found for session {session_id}")
+            return None
+        except Exception as e:
+            logger.error(f"Error retrieving call metadata for session {session_id}: {e}")
+            return None
             
     async def log_session_event(self, log_id:str, session_id: str, event_data: Dict[str, Any]) -> str:
         """
