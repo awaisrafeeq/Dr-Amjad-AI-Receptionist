@@ -163,6 +163,8 @@ class RTMiddleTier:
                     response_active = False
                     hangup_sent = False  # Guard against double hangup
                     _dynamic_tasks: list = []  # tracks fire-and-forget tasks for cleanup
+                    _response_create_lock = asyncio.Lock()
+                    _acs_audio_queue: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=200)
 
                     # Per-session doctor validation: get_available_slots is blocked
                     # until get_available_doctors has been called and returned valid IDs.
@@ -203,9 +205,95 @@ class RTMiddleTier:
 
                     def _language_instruction() -> str:
                         _lang = detected_conversation_language or "de"
-                        if _lang == "en":
-                            return "Respond only in English. Do not mix German words into the sentence. "
-                        return "Respond only in German. Do not mix English words into the sentence. "
+                        _language_names = {
+                            "de": "German",
+                            "en": "English",
+                            "fr": "French",
+                            "it": "Italian",
+                            "es": "Spanish",
+                            "tr": "Turkish",
+                            "ar": "Arabic",
+                        }
+                        _name = _language_names.get(_lang, "German")
+                        return f"Respond only in {_name}. Do not mix other languages into the sentence. "
+
+                    async def send_response_create(response: Dict[str, Any], label: str, wait_idle: bool = True) -> bool:
+                        """Serialize response.create calls to avoid overlapping audio responses."""
+                        nonlocal response_active
+                        if call_end_requested.is_set():
+                            logger.debug(f"[RESPONSE CREATE] Skipping {label}; call ending")
+                            return False
+
+                        async with _response_create_lock:
+                            if wait_idle and response_active:
+                                await wait_for_response_idle(timeout=2.0)
+                            if response_active:
+                                logger.debug(f"[RESPONSE CREATE] Skipping {label}; previous response still active")
+                                return False
+
+                            try:
+                                await target_ws.send_str(_json_dumps({
+                                    "type": "response.create",
+                                    "response": response,
+                                }))
+                                # Set eagerly. OpenAI will later confirm with response.created,
+                                # but this prevents another local task from starting overlapping audio.
+                                response_active = True
+                                response_idle_event.clear()
+                                logger.debug(f"[RESPONSE CREATE] Sent {label}")
+                                return True
+                            except Exception as e:
+                                logger.error(f"[RESPONSE CREATE] Failed {label}: {e}")
+                                response_active = False
+                                response_idle_event.set()
+                                return False
+
+                    async def acs_audio_sender() -> None:
+                        """Send ACS audio frames from a single ordered queue.
+
+                        Directly writing every OpenAI audio delta to the ACS websocket can
+                        make playout bursty when the event loop is busy. This sender keeps
+                        writes ordered and provides a tiny jitter buffer.
+                        """
+                        try:
+                            while True:
+                                item = await _acs_audio_queue.get()
+                                try:
+                                    if item is None:
+                                        return
+                                    await ws.send_text(item)
+                                    await asyncio.sleep(0)
+                                finally:
+                                    _acs_audio_queue.task_done()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            logger.error(f"[ACS AUDIO] Sender error: {e}")
+
+                    async def enqueue_acs_audio_message(data: Dict[str, Any]) -> None:
+                        payload = _json_dumps(data)
+                        if _acs_audio_queue.full():
+                            # Prefer dropping one stale audio frame over blocking long enough
+                            # to create audible burst playback on the phone line.
+                            try:
+                                _acs_audio_queue.get_nowait()
+                                _acs_audio_queue.task_done()
+                                logger.warning("[ACS AUDIO] Dropped stale audio frame due to full queue")
+                            except asyncio.QueueEmpty:
+                                pass
+                        await _acs_audio_queue.put(payload)
+
+                    async def clear_acs_audio_queue() -> None:
+                        cleared = 0
+                        while True:
+                            try:
+                                _acs_audio_queue.get_nowait()
+                                _acs_audio_queue.task_done()
+                                cleared += 1
+                            except asyncio.QueueEmpty:
+                                break
+                        if cleared:
+                            logger.debug(f"[ACS AUDIO] Cleared {cleared} queued frame(s)")
 
                     async def send_assistant_prompt(instructions: str) -> None:
                         nonlocal response_active
@@ -216,21 +304,15 @@ class RTMiddleTier:
                             except Exception as e:
                                 logger.error(f"Failed to cancel active response: {e}")
 
-                        try:
-                            await target_ws.send_str(
-                                json.dumps(
-                                    {
-                                        "type": "response.create",
-                                        "response": {
-                                            "modalities": ["audio", "text"],
-                                            "voice": self.selected_voice,
-                                            "instructions": instructions,
-                                        },
-                                    }
-                                )
-                            )
-                        except Exception:
-                            logger.exception("Failed to send response.create")
+                        await send_response_create(
+                            {
+                                "modalities": ["audio", "text"],
+                                "voice": self.selected_voice,
+                                "instructions": instructions,
+                            },
+                            label="assistant_prompt",
+                            wait_idle=True,
+                        )
 
                     async def _do_acs_hangup(reason: str) -> bool:
                         """Centralized ACS hangup with full diagnostic logging.
@@ -366,18 +448,17 @@ class RTMiddleTier:
                         hardcoded_greeting = "MedCenter Volta, Sie sprechen mit Kaya, der digitalen Assistentin. Wie kann ich Ihnen behilflich sein?"
 
                         try:
-                            await target_ws.send_str(
-                                _json_dumps({
-                                    "type": "response.create",
-                                    "response": {
-                                        "modalities": ["audio", "text"],
-                                        "voice": self.selected_voice,
-                                        "instructions": (
-                                            f"Say EXACTLY and ONLY this sentence, word for word, nothing before it and nothing after it: "
-                                            f'"{hardcoded_greeting}"'
-                                        )
-                                    }
-                                })
+                            await send_response_create(
+                                {
+                                    "modalities": ["audio", "text"],
+                                    "voice": self.selected_voice,
+                                    "instructions": (
+                                        f"Say EXACTLY and ONLY this sentence, word for word, nothing before it and nothing after it: "
+                                        f'"{hardcoded_greeting}"'
+                                    )
+                                },
+                                label="initial_greeting",
+                                wait_idle=True,
                             )
                             logger.info("[GREETING] Sent")
                         except Exception as e:
@@ -579,18 +660,38 @@ class RTMiddleTier:
                                             "get_available_doctors": {
                                                 "en": "I am checking the available doctors, please wait a moment.",
                                                 "de": "Ich pruefe die verfuegbaren Aerzte, bitte warten Sie einen Moment.",
+                                                "fr": "Je verifie les medecins disponibles, veuillez patienter un instant.",
+                                                "it": "Controllo i medici disponibili, attenda un momento.",
+                                                "es": "Estoy comprobando los medicos disponibles, espere un momento.",
+                                                "tr": "Uygun doktorlari kontrol ediyorum, lutfen biraz bekleyin.",
+                                                "ar": "سأتحقق من الأطباء المتاحين، يرجى الانتظار لحظة.",
                                             },
                                             "get_available_slots": {
                                                 "en": "I am still checking the appointment availability, please wait a moment.",
                                                 "de": "Ich pruefe noch die Terminverfuegbarkeit, bitte warten Sie einen Moment.",
+                                                "fr": "Je verifie encore les disponibilites, veuillez patienter un instant.",
+                                                "it": "Sto ancora controllando le disponibilita, attenda un momento.",
+                                                "es": "Aun estoy comprobando la disponibilidad, espere un momento.",
+                                                "tr": "Randevu uygunlugunu kontrol ediyorum, lutfen biraz bekleyin.",
+                                                "ar": "ما زلت أتحقق من المواعيد المتاحة، يرجى الانتظار لحظة.",
                                             },
                                             "get_next_available_slot": {
                                                 "en": "I am still looking for the next available appointment, please wait a moment.",
                                                 "de": "Ich suche noch den naechsten verfuegbaren Termin, bitte warten Sie einen Moment.",
+                                                "fr": "Je cherche le prochain rendez-vous disponible, veuillez patienter un instant.",
+                                                "it": "Sto cercando il prossimo appuntamento disponibile, attenda un momento.",
+                                                "es": "Estoy buscando la proxima cita disponible, espere un momento.",
+                                                "tr": "En yakin uygun randevuyu ariyorum, lutfen biraz bekleyin.",
+                                                "ar": "أبحث عن أقرب موعد متاح، يرجى الانتظار لحظة.",
                                             },
                                             "book_appointment": {
                                                 "en": "I am booking your appointment, please wait a moment.",
                                                 "de": "Ich buche Ihren Termin, bitte warten Sie einen Moment.",
+                                                "fr": "Je reserve votre rendez-vous, veuillez patienter un instant.",
+                                                "it": "Sto prenotando il suo appuntamento, attenda un momento.",
+                                                "es": "Estoy reservando su cita, espere un momento.",
+                                                "tr": "Randevunuzu kaydediyorum, lutfen biraz bekleyin.",
+                                                "ar": "سأحجز موعدك الآن، يرجى الانتظار لحظة.",
                                             },
                                         }
 
@@ -608,9 +709,8 @@ class RTMiddleTier:
                                                 if response_active or call_end_requested.is_set():
                                                     return
 
-                                                await target_ws.send_str(_json_dumps({
-                                                    "type": "response.create",
-                                                    "response": {
+                                                await send_response_create(
+                                                    {
                                                         "modalities": ["audio", "text"],
                                                         "voice": self.selected_voice,
                                                         "tool_choice": "none",
@@ -620,10 +720,10 @@ class RTMiddleTier:
                                                             f"Say EXACTLY this one short sentence: '{_message}' "
                                                             "Then STOP. Say NOTHING else. Do NOT list anything. Do NOT guess results."
                                                         )
-                                                    }
-                                                }))
-                                                response_active = True
-                                                response_idle_event.clear()
+                                                    },
+                                                    label=f"holding:{_func_name}",
+                                                    wait_idle=True,
+                                                )
                                                 _kind = "keepalive" if keepalive else "initial"
                                                 logger.info(f"[HOLDING] {_kind} {_func_name}")
                                             except Exception as __he:
@@ -631,11 +731,18 @@ class RTMiddleTier:
 
                                         async def _tool_keepalive_loop(_func_name: str, _stop_event: asyncio.Event):
                                             # The first short holding prompt is sent immediately. If the API
-                                            # still has not returned, gently reassure the caller every few seconds.
+                                            # still has not returned, reassure the caller only a limited number
+                                            # of times so Kaya does not fall into an endless "please wait" loop.
                                             try:
                                                 await asyncio.sleep(7)
-                                                while not _stop_event.is_set() and not call_end_requested.is_set():
+                                                _keepalive_count = 0
+                                                while (
+                                                    _keepalive_count < 2
+                                                    and not _stop_event.is_set()
+                                                    and not call_end_requested.is_set()
+                                                ):
                                                     await _send_tool_holding_prompt(_func_name, keepalive=True)
+                                                    _keepalive_count += 1
                                                     await asyncio.sleep(9)
                                             except asyncio.CancelledError:
                                                 pass
@@ -1110,6 +1217,7 @@ class RTMiddleTier:
                                                     __onedoc_key = _res.get("onedoc_key") or _res.get("onedocKey") or _res.get("key") if isinstance(_res, dict) else None
                                                     if __onedoc_key:
                                                         logger.info(f"[BOOKING SUCCESS] {_args.get('slot_iso')[:10]} ref:{__onedoc_key[:8]}...")
+                                                        session_manager.mark_appointment_booked(session_id)
                                                         _result = _json_dumps({"status": "success", "booking_reference": __onedoc_key, "instruction": "DO NOT speak the booking_reference to the caller. Confirm the appointment details briefly, then ask if there is anything else you can help with. Only call terminate_call after the caller confirms they have no further questions and you have said goodbye."})
 
                                                         # --- PHONEBOOK INTEGRATION (fire-and-forget) ---
@@ -1271,26 +1379,31 @@ class RTMiddleTier:
                                                 if not _hung:
                                                     logger.error("[CALL END] terminate_call hangup FAILED — call may remain connected")
 
-                                            elif _func_name == "store_insurance_card_number":
-                                                __card = _args.get("card_number", "").strip()
-                                                # Remove any spaces/dashes for validation
-                                                __card_digits = re.sub(r'[\s\-]', '', __card)
-                                                if __card_digits and session_id:
-                                                    # Validate: must start with 807 and be exactly 20 digits
-                                                    if not __card_digits.startswith("807"):
-                                                        _result = _json_dumps({"status": "error", "message": "Invalid card number — it must start with 807. Please ask the caller to check the number on the front of their card and try again."})
-                                                    elif len(__card_digits) != 20:
-                                                        _result = _json_dumps({"status": "error", "message": f"Invalid card number — it must be exactly 20 digits. The number provided has {len(__card_digits)} digits. Please ask the caller to re-read the complete number."})
-                                                    elif not __card_digits.isdigit():
-                                                        _result = _json_dumps({"status": "error", "message": "Invalid card number — it must contain only digits. Please ask the caller to re-read the number."})
-                                                    else:
-                                                        __sess = session_manager.active_sessions.get(session_id)
-                                                        if __sess:
-                                                            __sess.insurance_card_number = __card_digits
-                                                            logger.info(f"[INSURANCE] Stored card number for session {session_id[:8]}")
-                                                        _result = _json_dumps({"status": "success", "message": "Insurance card number stored for documentation."})
-                                                else:
-                                                    _result = _json_dumps({"status": "error", "message": "No card number provided or no active session."})
+                                            elif _func_name == "forward_request_to_office":
+                                                try:
+                                                    __reason = (_args.get("reason") or "other").strip()
+                                                    __summary = (_args.get("summary") or "").strip()
+                                                    __urgency = (_args.get("urgency") or "unknown").strip()
+                                                    if not __summary:
+                                                        __summary = "Manual review requested because the call could not continue safely or clearly."
+
+                                                    __sent = await session_manager.send_office_handoff_email(
+                                                        session_id=session_id,
+                                                        reason=__reason,
+                                                        summary=__summary,
+                                                        urgency=__urgency,
+                                                    )
+                                                    _result = _json_dumps({
+                                                        "status": "success" if __sent else "error",
+                                                        "message": (
+                                                            "Office follow-up has been queued. Briefly tell the caller the request will be reviewed by the team, then close the call politely."
+                                                            if __sent
+                                                            else "Office follow-up could not be queued. Briefly tell the caller the request will be documented, then close politely."
+                                                        ),
+                                                    })
+                                                except Exception as __e:
+                                                    logger.error(f"Error in forward_request_to_office: {__e}")
+                                                    _result = _json_dumps({"status": "error", "message": str(__e)})
 
                                             elif _func_name == "search_knowledge_base":
                                                 try:
@@ -1342,13 +1455,14 @@ class RTMiddleTier:
                                                 # Ensure any previous response (like 'One moment please') is dead
                                                 await wait_for_response_idle(timeout=1.5)
                                                 logger.debug(f"[FUNCTION RESULT] Sending response.create after {_func_name}")
-                                                await target_ws.send_str(_json_dumps({
-                                                    "type": "response.create",
-                                                    "response": {
+                                                await send_response_create(
+                                                    {
                                                         "modalities": ["audio", "text"],
                                                         "voice": self.selected_voice,
-                                                    }
-                                                }))
+                                                    },
+                                                    label=f"function_result:{_func_name}",
+                                                    wait_idle=True,
+                                                )
                                             else:
                                                 logger.info(f"[FUNCTION RESULT] Skipping response.create — call_end_requested is set (func={_func_name})")
 
@@ -1375,6 +1489,7 @@ class RTMiddleTier:
 
                                         # Flush ACS playout buffer by sending StopAudio
                                         try:
+                                            await clear_acs_audio_queue()
                                             await ws.send_text(json.dumps({
                                                 "kind": "StopAudio"
                                             }))
@@ -1446,11 +1561,11 @@ class RTMiddleTier:
                                                     if detected_conversation_language != "de":
                                                         detected_conversation_language = "de"
                                                         logger.info(f"[LANG] Explicit switch to German detected from {transcription_data.get('speaker')}")
-                                                # Fall back to langdetect for longer utterances (increased from 15 to 30)
-                                                elif detect_lang and len(text) > 30:
+                                                # Fall back to language detection for meaningful utterances.
+                                                elif detect_lang and len(text) > 12:
                                                     try:
                                                         _lang = await asyncio.to_thread(detect_lang, text)
-                                                        if _lang and _lang in ("en", "de") and _lang != detected_conversation_language:
+                                                        if _lang and _lang in ("en", "de", "fr", "it", "es", "tr", "ar") and _lang != detected_conversation_language:
                                                             detected_conversation_language = _lang
                                                             logger.debug(f"[LANG] Detected from {transcription_data.get('speaker')}: {_lang}")
                                                     except Exception:
@@ -1465,7 +1580,10 @@ class RTMiddleTier:
                                         data = original_data
                                         
                                     if data:
-                                        await ws.send_text(_json_dumps(data))
+                                        if is_acs_audio_stream and data.get("kind") == "AudioData":
+                                            await enqueue_acs_audio_message(data)
+                                        else:
+                                            await ws.send_text(_json_dumps(data))
                                 elif msg.type == aiohttp.WSMsgType.ERROR:
                                     logger.error(f"WebSocket error: {target_ws.exception()}")
                                     break
@@ -1480,6 +1598,7 @@ class RTMiddleTier:
                         bg_tasks = [
                             asyncio.create_task(send_initial_greeting()),
                             asyncio.create_task(inactivity_monitor()),
+                            asyncio.create_task(acs_audio_sender()),
                         ]
 
                         forward_tasks = [

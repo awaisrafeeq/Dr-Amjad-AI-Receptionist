@@ -4,10 +4,12 @@ Session Manager for tracking call sessions and coordinating logging
 
 import logging
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 from uuid import uuid4
 from dataclasses import dataclass, asdict, field
+from difflib import SequenceMatcher
 from utils.azure_storage_logger import storage_logger
 from utils.phonebook_lookup import get_phonebook_lookup
 
@@ -18,6 +20,23 @@ def _phonebook_for_model(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
     if not data:
         return None
     return {key: (value if value not in (None, "") else "MISSING") for key, value in data.items()}
+
+
+def _normalize_for_match(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    import unicodedata
+    normalized = unicodedata.normalize("NFKD", value)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return " ".join(normalized.strip().lower().split())
+
+
+def _name_similarity(left: Optional[str], right: Optional[str]) -> float:
+    left_norm = _normalize_for_match(left)
+    right_norm = _normalize_for_match(right)
+    if not left_norm or not right_norm:
+        return 0.0
+    return SequenceMatcher(None, left_norm, right_norm).ratio()
 
 @dataclass
 class CallSession:
@@ -40,7 +59,13 @@ class CallSession:
     event_count: int = 0
     phonebook_match: Optional[Dict[str, Any]] = None
     phonebook_candidates: List[Dict[str, Any]] = field(default_factory=list)
-    insurance_card_number: Optional[str] = None
+    office_handoff_sent: bool = False
+    office_handoff_in_progress: bool = False
+    office_handoff_pending: Optional[Dict[str, Any]] = None
+    appointment_booked: bool = False
+    recent_transcript: List[Dict[str, Any]] = field(default_factory=list)
+    safety_review_in_progress: bool = False
+    last_safety_review_at: float = 0.0
 
 class SessionManager:
     """Manages call sessions and coordinates logging activities."""
@@ -409,7 +434,18 @@ class SessionManager:
             
             # Update session stats
             if session_id in self.active_sessions:
-                self.active_sessions[session_id].transcription_count += 1
+                session = self.active_sessions[session_id]
+                session.transcription_count += 1
+                session.recent_transcript.append(
+                    {
+                        "speaker": speaker,
+                        "utterance_text": utterance_text,
+                        "timestamp": unique_timestamp,
+                    }
+                )
+                session.recent_transcript = session.recent_transcript[-16:]
+                if speaker == "customer":
+                    self.maybe_start_safety_review(session_id)
             
             logger.debug(f"[TRANSCRIPT] {session_id[:8]}: {speaker} - {utterance_text[:30]}...")
             return transcription_id
@@ -417,6 +453,93 @@ class SessionManager:
         except Exception as e:
             logger.error(f"[TRANSCRIPT] Error: {e}")
             raise
+
+    def maybe_start_safety_review(self, session_id: str) -> None:
+        session = self.active_sessions.get(session_id)
+        if (
+            not session
+            or session.office_handoff_sent
+            or session.office_handoff_in_progress
+            or session.office_handoff_pending
+        ):
+            return
+
+        now = time.monotonic()
+        if session.safety_review_in_progress or (now - session.last_safety_review_at) < 8:
+            return
+
+        customer_text = " ".join(
+            entry.get("utterance_text", "")
+            for entry in session.recent_transcript
+            if entry.get("speaker") == "customer"
+        ).strip()
+        if len(customer_text) < 10:
+            return
+
+        session.safety_review_in_progress = True
+        session.last_safety_review_at = now
+        asyncio.create_task(self._run_safety_review(session_id))
+
+    async def _run_safety_review(self, session_id: str) -> None:
+        try:
+            from utils.ai_safety_judge import ai_safety_judge
+
+            session = self.active_sessions.get(session_id)
+            if not session:
+                return
+
+            assessment = await ai_safety_judge.assess(session.recent_transcript)
+            logger.info(
+                "[SAFETY JUDGE] session=%s handoff=%s reason=%s urgency=%s confidence=%.2f",
+                session_id[:8],
+                assessment.should_handoff,
+                assessment.reason,
+                assessment.urgency,
+                assessment.confidence,
+            )
+
+            if not assessment.should_handoff:
+                return
+
+            if not self._should_queue_safety_handoff(assessment):
+                logger.info(
+                    "[SAFETY JUDGE] Not queuing office handoff during live call for session=%s reason=%s urgency=%s",
+                    session_id[:8],
+                    assessment.reason,
+                    assessment.urgency,
+                )
+                return
+
+            summary = assessment.office_summary or "AI safety judge requested manual office review based on the live call transcript."
+            await self.send_office_handoff_email(
+                session_id=session_id,
+                reason=assessment.reason,
+                summary=summary,
+                urgency=assessment.urgency,
+            )
+        except Exception as e:
+            logger.error(f"[SAFETY JUDGE] Error for {session_id}: {e}")
+        finally:
+            session = self.active_sessions.get(session_id)
+            if session:
+                session.safety_review_in_progress = False
+
+    def _should_queue_safety_handoff(self, assessment: Any) -> bool:
+        """Decide which AI safety findings should become an office follow-up.
+
+        Same-day routine symptoms are handled inside the call flow. We only
+        queue office follow-up automatically for true emergency risk or when
+        the conversation itself can no longer be handled safely by the agent.
+        """
+        if assessment.confidence < 0.75:
+            return False
+        if assessment.reason == "urgent_medical":
+            return assessment.urgency == "emergency"
+        return assessment.reason in {
+            "confused_or_incoherent",
+            "repeated_misunderstanding",
+            "caller_requests_staff",
+        }
     
     def get_session(self, session_id: str) -> Optional[CallSession]:
         """Get session by session ID."""
@@ -454,19 +577,25 @@ class SessionManager:
             
             # Get all transcriptions for this session
             transcript_data = await storage_logger.get_transcriptions_for_session(session_id)
+
+            session = self.active_sessions.get(session_id)
+            if session and session.office_handoff_sent:
+                logger.info(f"[EMAIL] Skipping final transcript for {session_id} because office handoff email was already sent")
+                return True
+
+            if session and session.office_handoff_pending:
+                logger.info(f"[EMAIL] Sending queued office handoff for {session_id} at call end")
+                return await self._flush_office_handoff_email(
+                    session_id=session_id,
+                    caller_phone=caller_phone,
+                    transcript_data=transcript_data,
+                )
             
             if not transcript_data:
                 logger.warning(f"[EMAIL] No transcripts for {session_id}")
                 return False
             
             caller_info = {"phone": caller_phone} if caller_phone else None
-
-            # Attach insurance card number if collected during the call
-            session = self.active_sessions.get(session_id)
-            if session and session.insurance_card_number:
-                if caller_info is None:
-                    caller_info = {}
-                caller_info["insurance_card_number"] = session.insurance_card_number
             
             # --- DOCTOR-SPECIFIC EMAIL ROUTING ---
             # Determine if this should go to a specific doctor
@@ -495,6 +624,134 @@ class SessionManager:
         except Exception as e:
             logger.error(f"[EMAIL] Error: {e}")
             return False
+
+    async def _flush_office_handoff_email(
+        self,
+        session_id: str,
+        caller_phone: Optional[str] = None,
+        transcript_data: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """Send a queued office handoff after the call has ended."""
+        async with self._session_lock:
+            session = self.active_sessions.get(session_id)
+            if not session:
+                logger.warning(f"[OFFICE HANDOFF] Session not found while flushing: {session_id}")
+                return False
+            if session.office_handoff_sent:
+                return True
+            if session.office_handoff_in_progress:
+                logger.info(f"[OFFICE HANDOFF] Flush already in progress for {session_id}")
+                return True
+            pending = dict(session.office_handoff_pending or {})
+            if not pending:
+                return False
+            session.office_handoff_in_progress = True
+
+        try:
+            from utils.email_service import email_service
+
+            session = self.active_sessions.get(session_id)
+            if not caller_phone and session and session.participants:
+                caller_phone = session.participants[0].get("phone_number")
+
+            if transcript_data is None:
+                transcript_data = await storage_logger.get_transcriptions_for_session(session_id)
+
+            success = await email_service.send_office_handoff_email(
+                session_id=session_id,
+                reason=pending.get("reason", "other"),
+                summary=pending.get("summary", "Manual office review requested."),
+                urgency=pending.get("urgency", "unknown"),
+                caller_phone=caller_phone,
+                transcript_data=transcript_data or [],
+            )
+
+            async with self._session_lock:
+                session = self.active_sessions.get(session_id)
+                if session:
+                    if success:
+                        session.office_handoff_sent = True
+                        session.office_handoff_pending = None
+                    session.office_handoff_in_progress = False
+
+            if success:
+                logger.info(
+                    "[OFFICE HANDOFF] Sent at call end for %s reason=%s urgency=%s",
+                    session_id,
+                    pending.get("reason", "other"),
+                    pending.get("urgency", "unknown"),
+                )
+            else:
+                logger.error(f"[OFFICE HANDOFF] Failed at call end for {session_id}")
+            return success
+        except Exception as e:
+            logger.error(f"[OFFICE HANDOFF] Flush error: {e}")
+            async with self._session_lock:
+                session = self.active_sessions.get(session_id)
+                if session:
+                    session.office_handoff_in_progress = False
+            return False
+
+    async def send_office_handoff_email(
+        self,
+        session_id: str,
+        reason: str,
+        summary: str,
+        urgency: str = "unknown",
+    ) -> bool:
+        """Queue a manual office follow-up to be emailed after the call ends."""
+        handoff = {
+            "reason": reason or "other",
+            "summary": summary or "Manual office review requested.",
+            "urgency": urgency or "unknown",
+            "queued_at": datetime.now(timezone.utc).isoformat(),
+        }
+        priority = {"emergency": 4, "same_day": 3, "this_week": 2, "routine": 1, "unknown": 0}
+
+        async with self._session_lock:
+            session = self.active_sessions.get(session_id)
+            if not session:
+                logger.warning(f"[OFFICE HANDOFF] Cannot queue; session not found: {session_id}")
+                return False
+            if session.office_handoff_sent:
+                logger.info(f"[OFFICE HANDOFF] Already sent for {session_id}")
+                return True
+
+            existing = session.office_handoff_pending
+            if existing:
+                existing_priority = priority.get(str(existing.get("urgency", "unknown")), 0)
+                new_priority = priority.get(handoff["urgency"], 0)
+                if new_priority >= existing_priority:
+                    session.office_handoff_pending = handoff
+                    logger.info(
+                        "[OFFICE HANDOFF] Updated queued handoff for %s reason=%s urgency=%s",
+                        session_id,
+                        handoff["reason"],
+                        handoff["urgency"],
+                    )
+                else:
+                    logger.info(f"[OFFICE HANDOFF] Keeping existing queued handoff for {session_id}")
+                return True
+
+            session.office_handoff_pending = handoff
+            logger.info(
+                "[OFFICE HANDOFF] Queued for call end session=%s reason=%s urgency=%s",
+                session_id,
+                handoff["reason"],
+                handoff["urgency"],
+            )
+            return True
+
+    def mark_appointment_booked(self, session_id: str) -> None:
+        """Record successful booking and clear non-emergency pending handoffs."""
+        session = self.active_sessions.get(session_id)
+        if not session:
+            return
+        session.appointment_booked = True
+        pending = session.office_handoff_pending
+        if pending and pending.get("urgency") != "emergency":
+            logger.info(f"[OFFICE HANDOFF] Clearing non-emergency queued handoff after successful booking for {session_id}")
+            session.office_handoff_pending = None
         
     def get_session_phonebook_info(self, session_id: str) -> Optional[Dict[str, Any]]:
         try:
@@ -538,6 +795,44 @@ class SessionManager:
                 "status": "matched",
                 "candidate_count": candidate_count,
                 "phonebook_match": _phonebook_for_model(session.phonebook_match),
+            }
+
+        fuzzy_candidates: List[Dict[str, Any]] = []
+        input_last = _normalize_for_match(last_name)
+        for candidate in session.phonebook_candidates or []:
+            candidate_last = _normalize_for_match(candidate.get("last_name"))
+            if input_last and candidate_last and input_last != candidate_last:
+                continue
+
+            first_score = _name_similarity(first_name, candidate.get("first_name"))
+            last_score = _name_similarity(last_name, candidate.get("last_name"))
+            if first_score >= 0.72 and last_score >= 0.90:
+                fuzzy_candidates.append(
+                    {
+                        "first_name": candidate.get("first_name"),
+                        "last_name": candidate.get("last_name"),
+                        "first_name_similarity": round(first_score, 3),
+                        "last_name_similarity": round(last_score, 3),
+                    }
+                )
+
+        if fuzzy_candidates:
+            fuzzy_candidates.sort(
+                key=lambda item: (item["last_name_similarity"], item["first_name_similarity"]),
+                reverse=True,
+            )
+            best = fuzzy_candidates[0]
+            return {
+                "matched": False,
+                "is_new_patient": False,
+                "status": "possible_name_asr_mismatch",
+                "candidate_count": candidate_count,
+                "possible_match": best,
+                "message": (
+                    "The spoken name may have been misheard by speech recognition. "
+                    "Ask the caller to spell the first name letter by letter, then confirm the full name again. "
+                    "Do not book until the spelling is confirmed."
+                ),
             }
 
         session.phonebook_match = None

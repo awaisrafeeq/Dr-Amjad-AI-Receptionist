@@ -117,6 +117,91 @@ class EmailService:
                         return doctor_email
         
         return None
+
+    async def send_office_handoff_email(
+        self,
+        *,
+        session_id: str,
+        reason: str,
+        summary: str,
+        urgency: str = "unknown",
+        caller_phone: Optional[str] = None,
+        transcript_data: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """Send a short manual-follow-up request to the office team."""
+        try:
+            recipients = self._parse_recipients(self.default_recipient)
+            if not recipients:
+                logger.error("No email recipients configured. Set EMAIL_DEFAULT_RECIPIENT.")
+                return False
+
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            safe_reason = html.escape(reason or "other")
+            safe_summary = html.escape(summary or "Manual review requested.")
+            safe_urgency = html.escape(urgency or "unknown")
+            safe_phone = html.escape(caller_phone or "Unknown")
+            transcript_text = self._format_transcript_text(transcript_data or [])
+            transcript_html = self._format_transcript_html(transcript_data or [])
+
+            subject = f"Kaya Office Follow-up - {safe_urgency} - {caller_phone or 'Unknown'} - {timestamp}"
+            html_body = f"""
+            <html>
+            <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+                <h2 style="color: #2c5aa0;">Kaya - Manual Office Follow-up</h2>
+                <div style="background-color: #f4f4f4; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
+                    <strong>Session ID:</strong> {html.escape(session_id)}<br>
+                    <strong>Caller:</strong> {safe_phone}<br>
+                    <strong>Date:</strong> {html.escape(timestamp)}<br>
+                    <strong>Reason:</strong> {safe_reason}<br>
+                    <strong>Urgency:</strong> {safe_urgency}<br>
+                </div>
+                <h3 style="color: #2c5aa0;">Summary:</h3>
+                <p>{safe_summary}</p>
+                <h3 style="color: #2c5aa0;">Transcript so far:</h3>
+                <div style="border-left: 3px solid #2c5aa0; padding-left: 15px;">
+                    {transcript_html}
+                </div>
+            </body>
+            </html>
+            """
+            text_body = f"""Kaya - Manual Office Follow-up
+
+Session ID: {session_id}
+Caller: {caller_phone or 'Unknown'}
+Date: {timestamp}
+Reason: {reason or 'other'}
+Urgency: {urgency or 'unknown'}
+
+Summary:
+{summary or 'Manual review requested.'}
+
+Transcript so far:
+{transcript_text}
+"""
+
+            if self.connection_string:
+                success = await self._send_via_acs_email(
+                    recipients=recipients,
+                    subject=subject,
+                    html_body=html_body,
+                    text_body=text_body,
+                )
+                if success:
+                    return True
+
+            if self.sendgrid_api_key:
+                return await self._send_via_sendgrid(
+                    recipients=recipients,
+                    subject=subject,
+                    html_body=html_body,
+                    text_body=text_body,
+                )
+
+            logger.error("No email service configured. Set ACS_EMAIL_CONNECTION_STRING or SENDGRID_API_KEY.")
+            return False
+        except Exception as e:
+            logger.error(f"Error sending office handoff email: {e}")
+            return False
         
     async def send_transcript_email(
         self, 
@@ -152,16 +237,8 @@ class EmailService:
             
             # Build email subject
             caller_phone = caller_info.get("phone", "Unknown") if caller_info else "Unknown"
-            insurance_card_number = caller_info.get("insurance_card_number") if caller_info else None
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
             subject = f"Call Transcript - {caller_phone} - {timestamp}"
-
-            # Build insurance card HTML/text snippets (only for new patients)
-            insurance_html = ""
-            insurance_text = ""
-            if insurance_card_number:
-                insurance_html = f"<strong>Health Insurance Card No.:</strong> {insurance_card_number}<br>"
-                insurance_text = f"Health Insurance Card No.: {insurance_card_number}"
 
             # Build email body
             html_body = f"""
@@ -173,7 +250,6 @@ class EmailService:
                     <strong>Session ID:</strong> {session_id}<br>
                     <strong>Caller:</strong> {caller_phone}<br>
                     <strong>Date:</strong> {timestamp}<br>
-                    {insurance_html}
                 </div>
                 
                 <h3 style="color: #2c5aa0;">Conversation Transcript:</h3>
@@ -198,7 +274,6 @@ class EmailService:
 Session ID: {session_id}
 Caller: {caller_phone}
 Date: {timestamp}
-{insurance_text}
 
 --- Conversation Transcript ---
 

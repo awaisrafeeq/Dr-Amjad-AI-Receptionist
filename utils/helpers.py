@@ -87,7 +87,7 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                     {
                         "type": "function",
                         "name": "resolve_phonebook_identity",
-                        "description": "After the caller confirms their first and last name, determine whether this caller is an existing patient. Existing patient requires all three fields to match: caller phone number, first name, and last name. If any field differs, treat as a new patient.",
+                        "description": "After the caller confirms their first and last name, determine whether this caller is an existing patient. Existing patient requires caller phone number, first name, and last name. If the result status is possible_name_asr_mismatch, ask the caller to spell the first name letter by letter and retry with the corrected spelling before treating them as new.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -100,7 +100,7 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                     {
                         "type": "function",
                         "name": "book_appointment",
-                        "description": "Book an appointment for a patient. All required fields must be populated with real data before calling.",
+                        "description": "Book an appointment for a patient after the caller has confirmed the appointment slot and the required EPAAD patient fields. Required fields are full name, date of birth, telephone number, and address. Do not ask for insurance card number or email during the call.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -109,19 +109,19 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                                 "patient_first_name": {"type": "string", "description": "Patient first name in Latin characters only. Transliterate from Arabic, Chinese, Cyrillic, etc. before calling."},
                                 "patient_last_name": {"type": "string", "description": "Patient last name in Latin characters only. Transliterate from Arabic, Chinese, Cyrillic, etc. before calling."},
                                 "patient_dob": {"type": "string", "description": "Patient's Date of Birth in YYYY-MM-DD format."},
-                                "patient_phone": {"type": "string", "description": "Patient's phone number with country code (e.g. +41...)"},
+                                "patient_phone": {"type": "string", "description": "Optional. The backend uses the incoming ACS caller number automatically. Do not ask the caller for it."},
                                 "patient_gender": {"type": "string", "enum": ["male", "female", "other"], "description": "Patient's gender. Detect automatically from the caller's voice (male vs female voice characteristics). Do NOT ask the patient. Use 'male' for clearly male voices, 'female' for clearly female voices, 'other' only when voice is completely ambiguous."},
-                                "patient_email": {"type": "string", "description": "Patient's email address for appointment confirmation. Ask the patient for it if not already known from the phonebook."},
-                                "street": {"type": "string", "description": "Patient's exact street name provided by caller. DO NOT GUESS OR INVENT. If missing, DO NOT call tool; ask caller first."},
-                                "street_number": {"type": "string", "description": "Patient's house/street number."},
-                                "zip_code": {"type": "string", "description": "Patient's precise zip code provided by caller. DO NOT GUESS. If missing, ask caller first."},
-                                "city": {"type": "string", "description": "Patient's exact city provided by caller. DO NOT GUESS. If missing, ask caller first."},
+                                "patient_email": {"type": "string", "description": "Optional. Use only if already known from trusted phonebook data or volunteered by the caller. Do not ask for it during normal booking."},
+                                "street": {"type": "string", "description": "Patient's street name. Required by EPAAD. Ask the caller if not already known from a verified phonebook match."},
+                                "street_number": {"type": "string", "description": "Patient's house/street number. Required by EPAAD. Ask the caller if not already known from a verified phonebook match."},
+                                "zip_code": {"type": "string", "description": "Patient's postal/zip code. Required by EPAAD. Ask the caller if not already known from a verified phonebook match."},
+                                "city": {"type": "string", "description": "Patient's city. Required by EPAAD. Ask the caller if not already known from a verified phonebook match."},
                                 "visit_reason": {"type": "string", "description": "The reason for the visit as described by the patient. Used to determine appointment duration."},
                                 "comment": {"type": "string", "description": "Additional notes or comments for the appointment."}
                             },
                             "required": [
                                 "calendar_id", "slot_iso", "patient_first_name", "patient_last_name", 
-                                "patient_dob", "patient_phone", "street", "street_number", "zip_code", "city", "visit_reason", "patient_email"
+                                "patient_dob", "street", "street_number", "zip_code", "city", "visit_reason"
                             ]
                         }
                     },
@@ -136,17 +136,16 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                     },
                     {
                         "type": "function",
-                        "name": "store_insurance_card_number",
-                        "description": "Store the caller's Swiss health insurance card number for internal documentation. Call this ONLY for NEW/unmatched patients after they provide their card number. The number MUST start with 807 and be exactly 20 digits. If validation fails, ask the caller to re-read the number.",
+                        "name": "forward_request_to_office",
+                        "description": "Forward the caller's request to the office team when the conversation is stuck, unclear after two attempts, too confused to continue safely, urgent but not suitable for normal booking, or the caller asks for staff/manual follow-up. Use this instead of looping.",
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "card_number": {
-                                    "type": "string",
-                                    "description": "The 20-digit health insurance card number starting with 807. Must be exactly 20 digits, digits only."
-                                }
+                                "reason": {"type": "string", "enum": ["repeated_misunderstanding", "confused_or_incoherent", "urgent_medical", "caller_requests_staff", "other"], "description": "Why the request is being forwarded."},
+                                "summary": {"type": "string", "description": "Brief factual summary of what the caller said and what needs manual follow-up. State uncertainty clearly; do not invent names, symptoms, or details."},
+                                "urgency": {"type": "string", "enum": ["emergency", "same_day", "this_week", "routine", "unknown"], "description": "Urgency level based only on what the caller clearly said."}
                             },
-                            "required": ["card_number"]
+                            "required": ["reason", "summary", "urgency"]
                         }
                     },
                     {
