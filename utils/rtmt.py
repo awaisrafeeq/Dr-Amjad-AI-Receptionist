@@ -155,6 +155,7 @@ class RTMiddleTier:
                     last_user_activity_ts = loop.time()
                     last_prompt_stage = 0
                     detected_conversation_language: Optional[str] = "de"
+                    _phonebook_context = ""
 
                     last_kb_context: Optional[str] = None
 
@@ -203,8 +204,7 @@ class RTMiddleTier:
                         _sess = session_manager.active_sessions.get(session_id)
                         return _sess.phonebook_match if _sess else None
 
-                    def _language_instruction() -> str:
-                        _lang = detected_conversation_language or "de"
+                    def _language_name(_lang: Optional[str]) -> str:
                         _language_names = {
                             "de": "German",
                             "en": "English",
@@ -213,9 +213,69 @@ class RTMiddleTier:
                             "es": "Spanish",
                             "tr": "Turkish",
                             "ar": "Arabic",
+                            "ku": "Kurdish",
+                            "ku-kmr": "Kurdish Kurmanji in Latin script",
+                            "ku-ckb": "Kurdish Sorani in Arabic script",
                         }
-                        _name = _language_names.get(_lang, "German")
+                        return _language_names.get(_lang or "de", "German")
+
+                    def _language_instruction() -> str:
+                        _lang = detected_conversation_language or "de"
+                        _name = _language_name(_lang)
+                        if _lang == "ku":
+                            return (
+                                "The caller requested Kurdish but the dialect is not confirmed. "
+                                "Ask one short clarification: Kurmanji or Sorani? Do not continue in generic Kurdish. "
+                            )
                         return f"Respond only in {_name}. Do not mix other languages into the sentence. "
+
+                    def _language_session_hint() -> str:
+                        _lang = detected_conversation_language or "de"
+                        if _lang == "ku":
+                            return (
+                                "[CURRENT CALL LANGUAGE]\n"
+                                "The caller requested Kurdish. Ask once whether they prefer Kurmanji or Sorani, "
+                                "then continue only in the confirmed dialect."
+                            )
+                        return (
+                            "[CURRENT CALL LANGUAGE]\n"
+                            f"Use {_language_name(_lang)} for all spoken responses, holding prompts, and goodbye messages. "
+                            "Do not switch languages unless the caller clearly requests it."
+                        )
+
+                    async def update_session_language_hint(reason: str) -> None:
+                        try:
+                            _parts = [self.system_message or ""]
+                            if _phonebook_context:
+                                _parts.append(_phonebook_context)
+                            _parts.append(_language_session_hint())
+                            await target_ws.send_str(
+                                _json_dumps({
+                                    "type": "session.update",
+                                    "session": {"instructions": "\n\n".join(part for part in _parts if part)}
+                                })
+                            )
+                            logger.info(f"[LANG] Session language hint updated ({reason}): {detected_conversation_language}")
+                        except Exception as _lang_update_err:
+                            logger.debug(f"[LANG] Could not update session language hint: {_lang_update_err}")
+
+                    async def set_conversation_language(_lang: str, reason: str) -> None:
+                        nonlocal detected_conversation_language
+                        if _lang and _lang != detected_conversation_language:
+                            detected_conversation_language = _lang
+                            logger.info(f"[LANG] Switched to {_lang} ({reason})")
+                            await update_session_language_hint(reason)
+
+                    def _detect_kurdish_language(text: str) -> Optional[str]:
+                        if any(phrase in text for phrase in ["sorani", "soranî", "سۆرانی", "سورانی"]):
+                            return "ku-ckb"
+                        if any(phrase in text for phrase in ["kurmanji", "kurmanci", "kurmancî", "کرمانجی"]):
+                            return "ku-kmr"
+                        if any(phrase in text for phrase in ["kurdish", "kurdisch", "kurdi", "kurdî", "کوردی", "كردي"]):
+                            return "ku"
+                        if any(ch in text for ch in ["ڵ", "ڕ", "ێ", "ۆ", "ە"]):
+                            return "ku-ckb"
+                        return None
 
                     async def send_response_create(response: Dict[str, Any], label: str, wait_idle: bool = True) -> bool:
                         """Serialize response.create calls to avoid overlapping audio responses."""
@@ -376,6 +436,7 @@ class RTMiddleTier:
                             return False
 
                     async def send_initial_greeting() -> None:
+                        nonlocal _phonebook_context
                         if not is_acs_audio_stream:
                             return
                         try:
@@ -426,12 +487,12 @@ class RTMiddleTier:
                                         "If it returns matched=false, treat the caller as a new patient and collect all required details.",
                                         "NEVER mention this data to the caller. NEVER say their name first.",
                                     ]
-                                    _pb_context = "\n".join(_pb_lines)
+                                    _phonebook_context = "\n".join(_pb_lines)
                                     await target_ws.send_str(
                                         _json_dumps({
                                             "type": "session.update",
                                             "session": {
-                                                "instructions": (self.system_message or "") + "\n\n" + _pb_context
+                                                "instructions": (self.system_message or "") + "\n\n" + _phonebook_context + "\n\n" + _language_session_hint()
                                             }
                                         })
                                     )
@@ -665,6 +726,9 @@ class RTMiddleTier:
                                                 "es": "Estoy comprobando los medicos disponibles, espere un momento.",
                                                 "tr": "Uygun doktorlari kontrol ediyorum, lutfen biraz bekleyin.",
                                                 "ar": "سأتحقق من الأطباء المتاحين، يرجى الانتظار لحظة.",
+                                                "ku": "Ji kerema xwe demekê bisekinin / تکایە چاوەڕێ بکە.",
+                                                "ku-kmr": "Ez doktorên berdest kontrol dikim, ji kerema xwe demekê bisekinin.",
+                                                "ku-ckb": "تکایە چاوەڕێ بکە، دکتۆرە بەردەستەکان دەپشکنم.",
                                             },
                                             "get_available_slots": {
                                                 "en": "I am still checking the appointment availability, please wait a moment.",
@@ -674,6 +738,9 @@ class RTMiddleTier:
                                                 "es": "Aun estoy comprobando la disponibilidad, espere un momento.",
                                                 "tr": "Randevu uygunlugunu kontrol ediyorum, lutfen biraz bekleyin.",
                                                 "ar": "ما زلت أتحقق من المواعيد المتاحة، يرجى الانتظار لحظة.",
+                                                "ku": "Ji kerema xwe demekê bisekinin / تکایە چاوەڕێ بکە.",
+                                                "ku-kmr": "Ez berdestbûna randevûyê kontrol dikim, ji kerema xwe demekê bisekinin.",
+                                                "ku-ckb": "تکایە چاوەڕێ بکە، بەردەستی کاتەکانی چاوپێکەوتن دەپشکنم.",
                                             },
                                             "get_next_available_slot": {
                                                 "en": "I am still looking for the next available appointment, please wait a moment.",
@@ -683,6 +750,9 @@ class RTMiddleTier:
                                                 "es": "Estoy buscando la proxima cita disponible, espere un momento.",
                                                 "tr": "En yakin uygun randevuyu ariyorum, lutfen biraz bekleyin.",
                                                 "ar": "أبحث عن أقرب موعد متاح، يرجى الانتظار لحظة.",
+                                                "ku": "Ji kerema xwe demekê bisekinin / تکایە چاوەڕێ بکە.",
+                                                "ku-kmr": "Ez li randevûya herî nêzîk digerim, ji kerema xwe demekê bisekinin.",
+                                                "ku-ckb": "تکایە چاوەڕێ بکە، نزیکترین کاتی بەردەست دەدۆزمەوە.",
                                             },
                                             "book_appointment": {
                                                 "en": "I am booking your appointment, please wait a moment.",
@@ -692,6 +762,9 @@ class RTMiddleTier:
                                                 "es": "Estoy reservando su cita, espere un momento.",
                                                 "tr": "Randevunuzu kaydediyorum, lutfen biraz bekleyin.",
                                                 "ar": "سأحجز موعدك الآن، يرجى الانتظار لحظة.",
+                                                "ku": "Ji kerema xwe demekê bisekinin / تکایە چاوەڕێ بکە.",
+                                                "ku-kmr": "Ez randevûya we tomar dikim, ji kerema xwe demekê bisekinin.",
+                                                "ku-ckb": "تکایە چاوەڕێ بکە، ئێستا کاتەکەت تۆمار دەکەم.",
                                             },
                                         }
 
@@ -1267,7 +1340,10 @@ class RTMiddleTier:
                                                                     "sr": "Serbisch", "bs": "Bosnisch", "ro": "Rumänisch",
                                                                     "nl": "Niederländisch", "uk": "Ukrainisch",
                                                                     "ko": "Koreanisch", "zh": "Chinesisch", "ja": "Japanisch",
-                                                                    "fa": "Persisch", "ku": "Kurdisch", "so": "Somali",
+                                                                    "fa": "Persisch", "ku": "Kurdisch",
+                                                                    "ku-kmr": "Kurdisch (Kurmanji)",
+                                                                    "ku-ckb": "Kurdisch (Sorani)",
+                                                                    "so": "Somali",
                                                                 }
                                                                 pb_lang = lang_map.get(detected_conversation_language or "de", "Deutsch")
 
@@ -1551,23 +1627,28 @@ class RTMiddleTier:
                                             # prompts should not flip the conversation language.
                                             if transcription_data.get("speaker") == "customer":
                                                 text = transcription_data.get("utterance_text", "").strip().lower()
+                                                _language_switched = False
                                                 # Check for explicit language switch phrases first
                                                 if any(phrase in text for phrase in ["speak english", "in english", "switch to english", "we can speak english"]):
-                                                    if detected_conversation_language != "en":
-                                                        detected_conversation_language = "en"
-                                                        logger.info(f"[LANG] Explicit switch to English detected from {transcription_data.get('speaker')}")
+                                                    await set_conversation_language("en", "explicit English request")
+                                                    _language_switched = True
                                                 # Also detect from German phrases
                                                 elif any(phrase in text for phrase in ["deutsch", "auf deutsch", "auf deutsch sprechen"]):
-                                                    if detected_conversation_language != "de":
-                                                        detected_conversation_language = "de"
-                                                        logger.info(f"[LANG] Explicit switch to German detected from {transcription_data.get('speaker')}")
+                                                    await set_conversation_language("de", "explicit German request")
+                                                    _language_switched = True
+                                                else:
+                                                    _kurdish_lang = _detect_kurdish_language(text)
+                                                    if _kurdish_lang:
+                                                        await set_conversation_language(_kurdish_lang, "Kurdish dialect/request detected")
+                                                        _language_switched = True
                                                 # Fall back to language detection for meaningful utterances.
-                                                elif detect_lang and len(text) > 12:
+                                                if not _language_switched and detect_lang and len(text) > 12:
                                                     try:
                                                         _lang = await asyncio.to_thread(detect_lang, text)
-                                                        if _lang and _lang in ("en", "de", "fr", "it", "es", "tr", "ar") and _lang != detected_conversation_language:
-                                                            detected_conversation_language = _lang
-                                                            logger.debug(f"[LANG] Detected from {transcription_data.get('speaker')}: {_lang}")
+                                                        if _lang == "ku":
+                                                            _lang = "ku"
+                                                        if _lang and _lang in ("en", "de", "fr", "it", "es", "tr", "ar", "ku") and _lang != detected_conversation_language:
+                                                            await set_conversation_language(_lang, "automatic language detection")
                                                     except Exception:
                                                         pass
                                     except Exception as e:
