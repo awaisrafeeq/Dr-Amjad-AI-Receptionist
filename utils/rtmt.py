@@ -23,6 +23,7 @@ from utils.session_manager import session_manager
 from utils.document_utils import document_processor
 from utils.epaad_client import epaad_client
 from utils.availability import build_next_available_recommendation, build_slot_recommendation, compute_free_slots, default_opening_hours
+from utils.deepgram_live_transcriber import DeepgramLiveTranscriber
 
 try:
     from langdetect import detect as detect_lang
@@ -132,6 +133,22 @@ class RTMiddleTier:
     
     async def forward_messages(self, ws: WebSocket, is_acs_audio_stream: bool, session_id: Optional[str] = None):
         self._refresh_prompt_if_changed()
+        voice_agent_provider = (config.get("voice_agent_provider") or "openai_realtime").lower()
+        logger.info("[VOICE AGENT] provider=%s session=%s", voice_agent_provider, session_id)
+
+        if voice_agent_provider == "deepgram":
+            from utils.deepgram_voice_agent import DeepgramVoiceAgentBridge
+
+            bridge = DeepgramVoiceAgentBridge(
+                system_message=self.system_message,
+                doctor_cache=self._doctor_cache,
+            )
+            return await bridge.forward_messages(
+                ws=ws,
+                is_acs_audio_stream=is_acs_audio_stream,
+                session_id=session_id,
+            )
+
         async with aiohttp.ClientSession(base_url=self.endpoint) as session:
             headers = {
                 "api-key": self.key,
@@ -620,6 +637,31 @@ class RTMiddleTier:
                             await asyncio.sleep(0.1)  # Small delay between batches
                         _transcription_flush_task = None
 
+                    async def _queue_transcription(speaker: str, utterance_text: str, timestamp: Optional[str] = None) -> None:
+                        nonlocal _transcription_flush_task
+                        if not session_id or not utterance_text:
+                            return
+                        _transcription_batch.append({
+                            "session_id": session_id,
+                            "speaker": speaker,
+                            "utterance_text": utterance_text,
+                            "timestamp": timestamp,
+                        })
+                        if _transcription_flush_task is None:
+                            _transcription_flush_task = asyncio.create_task(_flush_transcriptions())
+
+                    async def _on_deepgram_transcript(transcript: str, metadata: Dict[str, Any]) -> None:
+                        await _queue_transcription("customer", transcript, None)
+                        logger.info(f"[DEEPGRAM TRANSCRIPT] customer: {transcript[:50]}...")
+
+                    deepgram_transcriber = (
+                        DeepgramLiveTranscriber.from_env(_on_deepgram_transcript)
+                        if is_acs_audio_stream
+                        else None
+                    )
+                    if deepgram_transcriber:
+                        logger.info(f"[DEEPGRAM] Live customer transcription enabled model={deepgram_transcriber.model}")
+
                     async def from_client_to_server():
                         nonlocal session_id
                         try:
@@ -651,6 +693,8 @@ class RTMiddleTier:
 
                                     if kind == "AudioData":
                                         last_user_activity_ts = loop.time()
+                                        if deepgram_transcriber:
+                                            await deepgram_transcriber.queue_acs_audio(data)
 
                                 if is_acs_audio_stream:
                                     data = transform_acs_to_openai_format(data, self.model, self.system_message, self.temperature, self.max_tokens, self.disable_audio, self.selected_voice)
@@ -1606,20 +1650,22 @@ class RTMiddleTier:
                                             # Log transcription asynchronously with batching
                                             if session_id:
                                                 try:
-                                                    # Add to batch queue for background processing
-                                                    _transcription_batch.append({
-                                                        "session_id": session_id,
-                                                        "speaker": transcription_data.get("speaker", "unknown"),
-                                                        "utterance_text": transcription_data.get("utterance_text", ""),
-                                                        "timestamp": transcription_data.get("timestamp")
-                                                    })
-                                                    # Schedule flush if not already running
-                                                    if _transcription_flush_task is None:
-                                                        _transcription_flush_task = asyncio.create_task(_flush_transcriptions())
-                                                    # Log transcript locally (fast, non-blocking)
                                                     speaker = transcription_data.get("speaker")
-                                                    text = transcription_data.get("utterance_text", "")[:50]
-                                                    logger.info(f"[TRANSCRIPT] {speaker}: {text}...")
+                                                    text_full = transcription_data.get("utterance_text", "")
+                                                    deepgram_is_logging_customer = (
+                                                        deepgram_transcriber
+                                                        and deepgram_transcriber.connected
+                                                        and not deepgram_transcriber.failed
+                                                    )
+                                                    if not (deepgram_is_logging_customer and speaker == "customer"):
+                                                        await _queue_transcription(
+                                                            speaker=speaker or "unknown",
+                                                            utterance_text=text_full,
+                                                            timestamp=transcription_data.get("timestamp"),
+                                                        )
+                                                        logger.info(f"[TRANSCRIPT] {speaker}: {text_full[:50]}...")
+                                                    else:
+                                                        logger.debug(f"[TRANSCRIPT] Skipped OpenAI customer transcript because Deepgram is enabled: {text_full[:50]}...")
                                                 except Exception as e:
                                                     logger.error(f"[TRANSCRIPT ERROR] {e}")
 
@@ -1681,6 +1727,8 @@ class RTMiddleTier:
                             asyncio.create_task(inactivity_monitor()),
                             asyncio.create_task(acs_audio_sender()),
                         ]
+                        if deepgram_transcriber:
+                            bg_tasks.append(asyncio.create_task(deepgram_transcriber.run()))
 
                         forward_tasks = [
                             asyncio.create_task(from_client_to_server()),
@@ -1702,6 +1750,8 @@ class RTMiddleTier:
                             except asyncio.CancelledError:
                                 pass
 
+                        if deepgram_transcriber:
+                            await deepgram_transcriber.close()
                         for task in bg_tasks:
                             task.cancel()
                             try:

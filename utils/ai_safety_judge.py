@@ -88,6 +88,7 @@ class AISafetyJudge:
                                 "Assess ONLY the transcript. Do not diagnose. Do not infer facts that are not stated. "
                                 "Flag for handoff when the caller appears medically urgent, incoherent/confused, stuck in repeated misunderstanding, "
                                 "or asks for human/manual follow-up. Be conservative for emergency: if clearly urgent, set urgency to emergency or same_day. "
+                                "Do not treat language preference or phrases like 'speak English' as a request for staff/manual follow-up. "
                                 "Return only valid JSON with keys: should_handoff boolean, reason string, urgency string, confidence number 0-1, "
                                 "office_summary string, caller_message string. "
                                 "Allowed reasons: normal, urgent_medical, confused_or_incoherent, repeated_misunderstanding, caller_requests_staff, other. "

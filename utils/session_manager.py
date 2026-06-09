@@ -475,6 +475,8 @@ class SessionManager:
         ).strip()
         if len(customer_text) < 10:
             return
+        if self._is_language_preference_only(customer_text):
+            return
 
         session.safety_review_in_progress = True
         session.last_safety_review_at = now
@@ -510,6 +512,13 @@ class SessionManager:
                 )
                 return
 
+            if assessment.reason == "caller_requests_staff" and not self._recent_transcript_has_staff_request(session.recent_transcript):
+                logger.info(
+                    "[SAFETY JUDGE] Ignoring caller_requests_staff without an explicit staff request session=%s",
+                    session_id[:8],
+                )
+                return
+
             summary = assessment.office_summary or "AI safety judge requested manual office review based on the live call transcript."
             await self.send_office_handoff_email(
                 session_id=session_id,
@@ -540,6 +549,60 @@ class SessionManager:
             "repeated_misunderstanding",
             "caller_requests_staff",
         }
+
+    def _is_language_preference_only(self, customer_text: str) -> bool:
+        text = _normalize_for_match(customer_text)
+        if not text:
+            return True
+        language_tokens = {
+            "speak english",
+            "speaking english",
+            "english",
+            "english please",
+            "in english",
+            "speak in english",
+            "deutsch",
+            "german",
+            "speak german",
+            "auf deutsch",
+            "francais",
+            "french",
+            "italian",
+            "spanish",
+            "turkish",
+            "arabic",
+            "kurdish",
+        }
+        compact = text.replace(".", "").strip()
+        return compact in language_tokens
+
+    def _recent_transcript_has_staff_request(self, transcript: List[Dict[str, Any]]) -> bool:
+        text = " ".join(
+            str(entry.get("utterance_text") or "")
+            for entry in transcript[-12:]
+            if entry.get("speaker") == "customer"
+        ).lower()
+        staff_phrases = (
+            "human",
+            "person",
+            "staff",
+            "reception",
+            "receptionist",
+            "office",
+            "team",
+            "callback",
+            "call back",
+            "call me",
+            "transfer",
+            "representative",
+            "mitarbeiter",
+            "praxis",
+            "rueckruf",
+            "rückruf",
+            "zurueckrufen",
+            "zurückrufen",
+        )
+        return any(phrase in text for phrase in staff_phrases)
     
     def get_session(self, session_id: str) -> Optional[CallSession]:
         """Get session by session ID."""

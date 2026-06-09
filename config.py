@@ -34,6 +34,32 @@ AZURE_OPENAI_API_TYPE = os.getenv("AZURE_OPENAI_API_TYPE")
 
 AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+TRANSCRIPTION_PROVIDER = os.getenv("TRANSCRIPTION_PROVIDER", "openai")
+DEEPGRAM_LIVE_TRANSCRIPTION_ENABLED = os.getenv("DEEPGRAM_LIVE_TRANSCRIPTION_ENABLED", "false")
+DEEPGRAM_LIVE_MODEL = os.getenv("DEEPGRAM_LIVE_MODEL", "flux-general-multi")
+DEEPGRAM_SAMPLE_RATE = os.getenv("DEEPGRAM_SAMPLE_RATE", "24000")
+DEEPGRAM_ENCODING = os.getenv("DEEPGRAM_ENCODING", "linear16")
+DEEPGRAM_LANGUAGE = os.getenv("DEEPGRAM_LANGUAGE")
+DEEPGRAM_LANGUAGE_HINT = os.getenv("DEEPGRAM_LANGUAGE_HINT")
+
+VOICE_AGENT_PROVIDER = os.getenv("VOICE_AGENT_PROVIDER", "openai_realtime")
+DEEPGRAM_AGENT_URL = os.getenv("DEEPGRAM_AGENT_URL", "wss://agent.deepgram.com/v1/agent/converse")
+DEEPGRAM_AGENT_LISTEN_MODEL = os.getenv("DEEPGRAM_AGENT_LISTEN_MODEL", "flux-general-multi")
+DEEPGRAM_AGENT_LISTEN_VERSION = os.getenv("DEEPGRAM_AGENT_LISTEN_VERSION", "v2")
+DEEPGRAM_AGENT_LANGUAGE = os.getenv("DEEPGRAM_AGENT_LANGUAGE")
+DEEPGRAM_AGENT_LANGUAGE_HINTS = os.getenv("DEEPGRAM_AGENT_LANGUAGE_HINTS", "de,en,fr,it,es,tr,ar,ku")
+DEEPGRAM_AGENT_EOT_THRESHOLD = os.getenv("DEEPGRAM_AGENT_EOT_THRESHOLD", "0.8")
+DEEPGRAM_AGENT_EAGER_EOT_THRESHOLD = os.getenv("DEEPGRAM_AGENT_EAGER_EOT_THRESHOLD", "0.5")
+DEEPGRAM_AGENT_SPEAK_MODEL = os.getenv("DEEPGRAM_AGENT_SPEAK_MODEL", "aura-2-elara-de")
+DEEPGRAM_AGENT_SPEAK_MODEL_DE = os.getenv("DEEPGRAM_AGENT_SPEAK_MODEL_DE", DEEPGRAM_AGENT_SPEAK_MODEL)
+DEEPGRAM_AGENT_SPEAK_MODEL_EN = os.getenv("DEEPGRAM_AGENT_SPEAK_MODEL_EN", "aura-2-thalia-en")
+DEEPGRAM_AGENT_OUTPUT_SAMPLE_RATE = os.getenv("DEEPGRAM_AGENT_OUTPUT_SAMPLE_RATE", "24000")
+DEEPGRAM_AGENT_THINK_PROVIDER = os.getenv("DEEPGRAM_AGENT_THINK_PROVIDER", "open_ai")
+DEEPGRAM_AGENT_THINK_MODEL = os.getenv("DEEPGRAM_AGENT_THINK_MODEL", "gpt-4o-mini")
+DEEPGRAM_AGENT_THINK_TEMPERATURE = os.getenv("DEEPGRAM_AGENT_THINK_TEMPERATURE", "0.3")
+DEEPGRAM_AGENT_PROMPT_MAX_CHARS = os.getenv("DEEPGRAM_AGENT_PROMPT_MAX_CHARS", "12000")
+
 ACS_SOURCE_NUMBER = os.getenv("ACS_SOURCE_NUMBER")
 ACS_CONNECTION_STRING = os.getenv("ACS_CONNECTION_STRING")
 DEVTUNNEL_ID = os.getenv("DEVTUNNEL_ID")
@@ -115,6 +141,30 @@ def get_config() -> Dict[str, Any]:
         "azure_openai_api_type": AZURE_OPENAI_API_TYPE,
         "devtunnel_id": DEVTUNNEL_ID,
         "azure_openai_embedding_deployment": AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+        "deepgram_api_key": DEEPGRAM_API_KEY,
+        "transcription_provider": TRANSCRIPTION_PROVIDER,
+        "deepgram_live_transcription_enabled": DEEPGRAM_LIVE_TRANSCRIPTION_ENABLED,
+        "deepgram_live_model": DEEPGRAM_LIVE_MODEL,
+        "deepgram_sample_rate": DEEPGRAM_SAMPLE_RATE,
+        "deepgram_encoding": DEEPGRAM_ENCODING,
+        "deepgram_language": DEEPGRAM_LANGUAGE,
+        "deepgram_language_hint": DEEPGRAM_LANGUAGE_HINT,
+        "voice_agent_provider": VOICE_AGENT_PROVIDER,
+        "deepgram_agent_url": DEEPGRAM_AGENT_URL,
+        "deepgram_agent_listen_model": DEEPGRAM_AGENT_LISTEN_MODEL,
+        "deepgram_agent_listen_version": DEEPGRAM_AGENT_LISTEN_VERSION,
+        "deepgram_agent_language": DEEPGRAM_AGENT_LANGUAGE,
+        "deepgram_agent_language_hints": DEEPGRAM_AGENT_LANGUAGE_HINTS,
+        "deepgram_agent_eot_threshold": DEEPGRAM_AGENT_EOT_THRESHOLD,
+        "deepgram_agent_eager_eot_threshold": DEEPGRAM_AGENT_EAGER_EOT_THRESHOLD,
+        "deepgram_agent_speak_model": DEEPGRAM_AGENT_SPEAK_MODEL,
+        "deepgram_agent_speak_model_de": DEEPGRAM_AGENT_SPEAK_MODEL_DE,
+        "deepgram_agent_speak_model_en": DEEPGRAM_AGENT_SPEAK_MODEL_EN,
+        "deepgram_agent_output_sample_rate": DEEPGRAM_AGENT_OUTPUT_SAMPLE_RATE,
+        "deepgram_agent_think_provider": DEEPGRAM_AGENT_THINK_PROVIDER,
+        "deepgram_agent_think_model": DEEPGRAM_AGENT_THINK_MODEL,
+        "deepgram_agent_think_temperature": DEEPGRAM_AGENT_THINK_TEMPERATURE,
+        "deepgram_agent_prompt_max_chars": DEEPGRAM_AGENT_PROMPT_MAX_CHARS,
         "azure_search_endpoint": AZURE_SEARCH_ENDPOINT,
         "azure_search_key": AZURE_SEARCH_KEY,
         "azure_blob_conn": AZURE_BLOB_CONN,
