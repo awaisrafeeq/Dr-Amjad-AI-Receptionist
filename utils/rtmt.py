@@ -141,7 +141,7 @@ class RTMiddleTier:
 
             bridge = DeepgramVoiceAgentBridge(
                 system_message=self.system_message,
-                doctor_cache=self._doctor_cache,
+                doctor_cache=dict(self._doctor_cache),
             )
             return await bridge.forward_messages(
                 ws=ws,

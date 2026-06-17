@@ -815,6 +815,26 @@ class SessionManager:
         if pending and pending.get("urgency") != "emergency":
             logger.info(f"[OFFICE HANDOFF] Clearing non-emergency queued handoff after successful booking for {session_id}")
             session.office_handoff_pending = None
+
+    def clear_recoverable_office_handoff(self, session_id: str, reason: str) -> bool:
+        """Clear a queued handoff when later conversation proves the case is recoverable."""
+        session = self.active_sessions.get(session_id)
+        if not session or not session.office_handoff_pending:
+            return False
+
+        pending = session.office_handoff_pending
+        if pending.get("urgency") == "emergency":
+            return False
+        if pending.get("reason") != reason:
+            return False
+
+        logger.info(
+            "[OFFICE HANDOFF] Clearing recoverable queued handoff for %s reason=%s",
+            session_id,
+            reason,
+        )
+        session.office_handoff_pending = None
+        return True
         
     def get_session_phonebook_info(self, session_id: str) -> Optional[Dict[str, Any]]:
         try:

@@ -48,7 +48,13 @@ DEEPGRAM_AGENT_URL = os.getenv("DEEPGRAM_AGENT_URL", "wss://agent.deepgram.com/v
 DEEPGRAM_AGENT_LISTEN_MODEL = os.getenv("DEEPGRAM_AGENT_LISTEN_MODEL", "flux-general-multi")
 DEEPGRAM_AGENT_LISTEN_VERSION = os.getenv("DEEPGRAM_AGENT_LISTEN_VERSION", "v2")
 DEEPGRAM_AGENT_LANGUAGE = os.getenv("DEEPGRAM_AGENT_LANGUAGE")
-DEEPGRAM_AGENT_LANGUAGE_HINTS = os.getenv("DEEPGRAM_AGENT_LANGUAGE_HINTS", "de,en,fr,it,es,tr,ar,ku")
+DEEPGRAM_AGENT_LANGUAGE_HINTS = os.getenv("DEEPGRAM_AGENT_LANGUAGE_HINTS", "de,en,fr,it,es")
+DEEPGRAM_AGENT_ALLOW_UNSUPPORTED_LANGUAGE_HINTS = os.getenv("DEEPGRAM_AGENT_ALLOW_UNSUPPORTED_LANGUAGE_HINTS", "false")
+DEEPGRAM_AGENT_KEYTERMS = os.getenv("DEEPGRAM_AGENT_KEYTERMS", "")
+DEEPGRAM_AGENT_ASR_OPTIMIZATION_ENABLED = os.getenv("DEEPGRAM_AGENT_ASR_OPTIMIZATION_ENABLED", "true")
+DEEPGRAM_AGENT_LANGUAGE_LOCK_ENABLED = os.getenv("DEEPGRAM_AGENT_LANGUAGE_LOCK_ENABLED", "true")
+DEEPGRAM_AGENT_RUNTIME_LISTEN_UPDATES_ENABLED = os.getenv("DEEPGRAM_AGENT_RUNTIME_LISTEN_UPDATES_ENABLED", "false")
+DEEPGRAM_AGENT_MAX_KEYTERMS = os.getenv("DEEPGRAM_AGENT_MAX_KEYTERMS", "80")
 DEEPGRAM_AGENT_EOT_THRESHOLD = os.getenv("DEEPGRAM_AGENT_EOT_THRESHOLD", "0.8")
 DEEPGRAM_AGENT_EAGER_EOT_THRESHOLD = os.getenv("DEEPGRAM_AGENT_EAGER_EOT_THRESHOLD", "0.5")
 DEEPGRAM_AGENT_SPEAK_MODEL = os.getenv("DEEPGRAM_AGENT_SPEAK_MODEL", "aura-2-elara-de")
@@ -155,6 +161,12 @@ def get_config() -> Dict[str, Any]:
         "deepgram_agent_listen_version": DEEPGRAM_AGENT_LISTEN_VERSION,
         "deepgram_agent_language": DEEPGRAM_AGENT_LANGUAGE,
         "deepgram_agent_language_hints": DEEPGRAM_AGENT_LANGUAGE_HINTS,
+        "deepgram_agent_allow_unsupported_language_hints": DEEPGRAM_AGENT_ALLOW_UNSUPPORTED_LANGUAGE_HINTS,
+        "deepgram_agent_keyterms": DEEPGRAM_AGENT_KEYTERMS,
+        "deepgram_agent_asr_optimization_enabled": DEEPGRAM_AGENT_ASR_OPTIMIZATION_ENABLED,
+        "deepgram_agent_language_lock_enabled": DEEPGRAM_AGENT_LANGUAGE_LOCK_ENABLED,
+        "deepgram_agent_runtime_listen_updates_enabled": DEEPGRAM_AGENT_RUNTIME_LISTEN_UPDATES_ENABLED,
+        "deepgram_agent_max_keyterms": DEEPGRAM_AGENT_MAX_KEYTERMS,
         "deepgram_agent_eot_threshold": DEEPGRAM_AGENT_EOT_THRESHOLD,
         "deepgram_agent_eager_eot_threshold": DEEPGRAM_AGENT_EAGER_EOT_THRESHOLD,
         "deepgram_agent_speak_model": DEEPGRAM_AGENT_SPEAK_MODEL,
