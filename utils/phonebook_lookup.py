@@ -96,6 +96,41 @@ def _normalize_name(value: Optional[str]) -> str:
     normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
     return " ".join(normalized.strip().lower().split())
 
+
+_NAME_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _name_tokens(value: Optional[str]) -> List[str]:
+    normalized = _normalize_name(value)
+    if not normalized:
+        return []
+    return [token for token in _NAME_TOKEN_SPLIT_RE.split(normalized) if token]
+
+
+def _token_set_name_match(
+    spoken_tokens: set,
+    stored_first: Optional[str],
+    stored_last: Optional[str],
+) -> bool:
+    """Order-free name match for compound official names.
+
+    Every spoken token must exist in the stored name, and both stored fields
+    must be covered by at least one spoken token. Without that second rule a
+    caller saying only "Hans Peter" would match a stored "Hans Peter Mueller"
+    whose surname was never spoken.
+    """
+    first_tokens = set(_name_tokens(stored_first))
+    last_tokens = set(_name_tokens(stored_last))
+
+    if len(spoken_tokens) < 2 or not first_tokens or not last_tokens:
+        return False
+
+    if not spoken_tokens.issubset(first_tokens | last_tokens):
+        return False
+
+    return bool(spoken_tokens & first_tokens) and bool(spoken_tokens & last_tokens)
+
+
 import time as _time
 
 _last_blob_refresh: float = 0.0
@@ -174,70 +209,96 @@ class PhonebookLookup:
         self._write_lock = threading.RLock()
 
     def load(self) -> None:
+        """Ensure the index is loaded. Cheap no-op once loaded — checks
+        _loaded before touching the write lock, so a live call is never
+        blocked behind a background refresh() or a phonebook write that
+        happens to be holding the lock at that moment (see refresh())."""
+        if self._loaded:
+            return
         with self._write_lock:
             if self._loaded:
                 return
+            index, entry_count = self._parse_workbook()
+            self._index = index
+            self._entry_count = entry_count
+            self._loaded = True
 
-            from openpyxl import load_workbook  # local import to avoid import cost if unused
+    def refresh(self) -> None:
+        """Rebuild the index from the current xlsx_path and swap it in.
 
-            self._index.clear()
-            self._entry_count = 0
+        The expensive XLSX parse runs without holding the write lock, so
+        concurrent readers (live calls calling load()/lookup_*) are never
+        blocked while a refresh is in progress — only the final swap is
+        under the lock, and that's just a couple of attribute assignments.
+        """
+        index, entry_count = self._parse_workbook()
+        with self._write_lock:
+            self._index = index
+            self._entry_count = entry_count
+            self._loaded = True
 
-            wb = load_workbook(self.xlsx_path, data_only=True, read_only=True)
-            try:
-                ws = wb[wb.sheetnames[0]]
-                rows = list(ws.iter_rows(values_only=True))
+    def _parse_workbook(self) -> Tuple[Dict[str, List["PhonebookMatch"]], int]:
+        """Pure parse of self.xlsx_path into a fresh index. Does not touch
+        self._index/_entry_count/_loaded and does not require the write lock."""
+        from openpyxl import load_workbook  # local import to avoid import cost if unused
 
-                header_idx = _find_header_row(rows)
-                if header_idx is None:
-                    # If schema changes, we fail closed (no lookup) rather than guessing.
-                    self._loaded = True
-                    return
+        index: Dict[str, List[PhonebookMatch]] = {}
+        entry_count = 0
 
-                header = [(_cell_to_str(c) or "") for c in rows[header_idx]]
-                col = {name: i for i, name in enumerate(header) if name}
+        wb = load_workbook(self.xlsx_path, data_only=True, read_only=True)
+        try:
+            ws = wb[wb.sheetnames[0]]
+            rows = list(ws.iter_rows(values_only=True))
 
-                def get(row: Tuple[Any, ...], name: str) -> Optional[str]:
-                    i = col.get(name)
-                    if i is None or i >= len(row):
-                        return None
-                    return _cell_to_str(row[i])
+            header_idx = _find_header_row(rows)
+            if header_idx is None:
+                # If schema changes, we fail closed (no lookup) rather than guessing.
+                return index, entry_count
 
-                for r in rows[header_idx + 1 :]:
-                    patient_no = get(r, "Patienten-Nr.")
-                    last = get(r, "Nachname")
-                    first = get(r, "Vorname")
-                    if not (patient_no or last or first):
-                        continue
+            header = [(_cell_to_str(c) or "") for c in rows[header_idx]]
+            col = {name: i for i, name in enumerate(header) if name}
 
-                    match = PhonebookMatch(
-                        patient_number=patient_no,
-                        last_name=last,
-                        first_name=first,
-                        gender=get(r, "Geschlecht"),
-                        birth_date=get(r, "Geburtsdatum"),
-                        language=get(r, "Sprache"),
-                        phone=get(r, "Telefon"),
-                        mobile=get(r, "Mobile-Nr."),
-                        email=get(r, "Email"),
-                        doctor=get(r, "Arzt"),
-                        note=get(r, "Notiz"),
-                        address=get(r, "Adresse"),
-                        zip_code=get(r, "PLZ"),
-                        city=get(r, "Ort"),
-                    )
+            def get(row: Tuple[Any, ...], name: str) -> Optional[str]:
+                i = col.get(name)
+                if i is None or i >= len(row):
+                    return None
+                return _cell_to_str(row[i])
 
-                    self._entry_count += 1
+            for r in rows[header_idx + 1 :]:
+                patient_no = get(r, "Patienten-Nr.")
+                last = get(r, "Nachname")
+                first = get(r, "Vorname")
+                if not (patient_no or last or first):
+                    continue
 
-                    for raw in [match.phone, match.mobile]:
-                        for v in normalize_phone_variants(raw):
-                            if v not in self._index:
-                                self._index[v] = []
-                            self._index[v].append(match)
+                match = PhonebookMatch(
+                    patient_number=patient_no,
+                    last_name=last,
+                    first_name=first,
+                    gender=get(r, "Geschlecht"),
+                    birth_date=get(r, "Geburtsdatum"),
+                    language=get(r, "Sprache"),
+                    phone=get(r, "Telefon"),
+                    mobile=get(r, "Mobile-Nr."),
+                    email=get(r, "Email"),
+                    doctor=get(r, "Arzt"),
+                    note=get(r, "Notiz"),
+                    address=get(r, "Adresse"),
+                    zip_code=get(r, "PLZ"),
+                    city=get(r, "Ort"),
+                )
 
-                self._loaded = True
-            finally:
-                wb.close()
+                entry_count += 1
+
+                for raw in [match.phone, match.mobile]:
+                    for v in normalize_phone_variants(raw):
+                        if v not in index:
+                            index[v] = []
+                        index[v].append(match)
+        finally:
+            wb.close()
+
+        return index, entry_count
 
     def add_patient(self, patient_data: Dict[str, Any]) -> bool:
         """
@@ -490,30 +551,86 @@ class PhonebookLookup:
 
         return candidates
 
-    def lookup_by_phone_and_name(self, phone: Optional[str], first_name: Optional[str], last_name: Optional[str]) -> Optional[PhonebookMatch]:
-        """Returns the phonebook match for the given phone number that also matches the provided name."""
-        if not phone:
-            return None
+    def match_by_phone_and_name(
+        self,
+        phone: Optional[str],
+        first_name: Optional[str],
+        last_name: Optional[str],
+    ) -> Tuple[Optional[PhonebookMatch], str]:
+        """Match a caller against the phonebook by phone plus first and last name.
 
-        self.load()
-        
+        Names are compared in three tiers, strictest first:
+          1. exact     — spoken first/last equal the stored Vorname/Nachname
+          2. swapped   — the stored row has the two name fields reversed
+          3. token set — every spoken token appears in the stored name in any
+                         order, covering both stored fields (compound names)
+
+        Tiers 2 and 3 only resolve when exactly one candidate qualifies, so a
+        number shared by a family can never resolve to the wrong person.
+        """
+        if not phone:
+            return None, "no_phone_match"
+
+        candidates = self.lookup_candidates_by_phone(phone)
+        if not candidates:
+            return None, "no_phone_match"
+
         cmp_first = _normalize_name(first_name)
         cmp_last = _normalize_name(last_name)
+        if not cmp_first or not cmp_last:
+            return None, "missing_name"
 
-        for v in normalize_phone_variants(phone):
-            matches = self._index.get(v)
-            if matches:
-                # Both first AND last name must match — one phone can belong to multiple people
-                if cmp_first and cmp_last:
-                    for m in matches:
-                        m_first = _normalize_name(m.first_name)
-                        m_last = _normalize_name(m.last_name)
-                        if cmp_first == m_first and cmp_last == m_last:
-                            return m
-                    # Phone matched but neither entry had matching both names → no identity match
-                    return None
+        spoken_tokens = set(_name_tokens(first_name) + _name_tokens(last_name))
+        swapped_matches: List[PhonebookMatch] = []
+        token_set_matches: List[PhonebookMatch] = []
 
-        return None
+        for m in candidates:
+            m_first = _normalize_name(m.first_name)
+            m_last = _normalize_name(m.last_name)
+
+            if cmp_first == m_first and cmp_last == m_last:
+                return m, "matched"
+
+            if cmp_first == m_last and cmp_last == m_first:
+                swapped_matches.append(m)
+            elif _token_set_name_match(spoken_tokens, m.first_name, m.last_name):
+                token_set_matches.append(m)
+
+        for status, tier in (("matched_swapped", swapped_matches), ("matched_token_set", token_set_matches)):
+            if len(tier) == 1:
+                m = tier[0]
+                logger.info(
+                    "[PHONEBOOK] %s — spoken=%r %r stored=%r %r patient=%s",
+                    status,
+                    first_name,
+                    last_name,
+                    m.first_name,
+                    m.last_name,
+                    m.patient_number,
+                )
+                return m, status
+            if len(tier) > 1:
+                logger.info(
+                    "[PHONEBOOK] %s rejected — %d candidates for spoken=%r %r",
+                    status,
+                    len(tier),
+                    first_name,
+                    last_name,
+                )
+                return None, "ambiguous_name_match"
+
+        logger.info(
+            "[PHONEBOOK] Name mismatch — spoken=%r %r candidates=%s",
+            first_name,
+            last_name,
+            [f"{m.first_name}|{m.last_name}" for m in candidates],
+        )
+        return None, "no_name_match"
+
+    def lookup_by_phone_and_name(self, phone: Optional[str], first_name: Optional[str], last_name: Optional[str]) -> Optional[PhonebookMatch]:
+        """Returns the phonebook match for the given phone number that also matches the provided name."""
+        match, _status = self.match_by_phone_and_name(phone, first_name, last_name)
+        return match
 
 
 def save_phonebook_to_blob(xlsx_path: str) -> bool:
@@ -571,10 +688,11 @@ def _refresh_phonebook_in_background() -> None:
 
         if _phonebook_singleton is None or _phonebook_singleton.xlsx_path != path:
             _phonebook_singleton = PhonebookLookup(path)
-
-        _phonebook_singleton._loaded = False
-        _phonebook_singleton._index.clear()
-        _phonebook_singleton.load()
+            _phonebook_singleton.load()
+        else:
+            # Hot-swap: parse happens outside the lock, so live calls on the
+            # main event loop never block behind this refresh.
+            _phonebook_singleton.refresh()
         logger.info("[PHONEBOOK] Refreshed from blob storage")
     except Exception as exc:
         logger.warning(f"[PHONEBOOK] Background refresh failed: {exc}")

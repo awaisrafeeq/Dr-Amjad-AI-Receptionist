@@ -4,6 +4,7 @@ Session Manager for tracking call sessions and coordinating logging
 
 import logging
 import asyncio
+import re
 import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
@@ -15,11 +16,71 @@ from utils.phonebook_lookup import get_phonebook_lookup
 
 logger = logging.getLogger(__name__)
 
+_EMPTY_FIELD_VALUES = {None, "", "MISSING", "[REDACTED]", "null", "None"}
+
 
 def _phonebook_for_model(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not data:
         return None
     return {key: (value if value not in (None, "") else "MISSING") for key, value in data.items()}
+
+
+def _field_present(value: Any) -> bool:
+    if value in _EMPTY_FIELD_VALUES:
+        return False
+    text = str(value).strip()
+    return bool(text) and text not in _EMPTY_FIELD_VALUES
+
+
+def phonebook_booking_field_plan(match: Optional[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """Decide which EPAAD fields are already on file and must not be re-asked."""
+    do_not_ask: List[str] = []
+    must_ask: List[str] = []
+    if not match:
+        return {"do_not_ask": do_not_ask, "must_ask": ["date_of_birth", "address"]}
+
+    if _field_present(match.get("birth_date")):
+        do_not_ask.append("date_of_birth")
+    else:
+        must_ask.append("date_of_birth")
+
+    address = str(match.get("address") or "").strip()
+    has_street = _field_present(address)
+    has_number = bool(re.search(r"\d", address))
+    has_zip = bool(re.sub(r"\D", "", str(match.get("zip_code") or "")))
+    has_city = _field_present(match.get("city"))
+
+    if has_street and has_number and has_zip and has_city:
+        do_not_ask.append("address")
+    elif not has_street:
+        must_ask.append("address")
+    else:
+        if not has_number:
+            must_ask.append("street_number")
+        if not has_zip:
+            must_ask.append("zip_code")
+        if not has_city:
+            must_ask.append("city")
+
+    return {"do_not_ask": do_not_ask, "must_ask": must_ask}
+
+
+def verified_patient_instruction(match: Optional[Dict[str, Any]], status: str) -> str:
+    plan = phonebook_booking_field_plan(match)
+    known = ", ".join(plan["do_not_ask"]) if plan["do_not_ask"] else "(none)"
+    missing = ", ".join(plan["must_ask"]) if plan["must_ask"] else "(none — do not collect any more demographics)"
+    return "\n".join(
+        [
+            "[INTERNAL — VERIFIED EXISTING PATIENT]",
+            f"Identity status: {status}. This caller is an existing patient.",
+            f"Do NOT ask the caller for: {known}.",
+            f"Ask only if still missing: {missing}.",
+            "After the appointment slot is confirmed, call book_appointment immediately.",
+            "Pass stored date of birth and address from the last resolve_phonebook_identity result, or omit those parameters so the backend fills them.",
+            "If the caller asks whether you already have their information, do not confirm or deny records. Continue booking without collecting known fields again.",
+            "Never read stored address, date of birth, email, or other file data aloud.",
+        ]
+    )
 
 
 def _normalize_for_match(value: Optional[str]) -> str:
@@ -392,8 +453,15 @@ class SessionManager:
         except Exception as e:
             logger.error(f"[EVENT] Log error: {e}")
     
-    async def log_transcription(self, session_id: str, speaker: str, utterance_text: str, 
-                               timestamp: Optional[str] = None) -> str:
+    async def log_transcription(
+        self,
+        session_id: str,
+        speaker: str,
+        utterance_text: str,
+        timestamp: Optional[str] = None,
+        source: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> str:
         """
         Log transcription data for a session.
         
@@ -426,6 +494,10 @@ class SessionManager:
                 "timestamp": unique_timestamp,
                 "utterance_text": utterance_text
             }
+            if source:
+                transcription_data["source"] = source
+            if model:
+                transcription_data["model"] = model
             
             # Use sessionId for Cosmos DB partition key
             transcription_data["sessionId"] = session_id
@@ -441,6 +513,8 @@ class SessionManager:
                         "speaker": speaker,
                         "utterance_text": utterance_text,
                         "timestamp": unique_timestamp,
+                        "source": source,
+                        "model": model,
                     }
                 )
                 session.recent_transcript = session.recent_transcript[-16:]
@@ -474,6 +548,8 @@ class SessionManager:
             if entry.get("speaker") == "customer"
         ).strip()
         if len(customer_text) < 10:
+            return
+        if self._is_language_preference_only(customer_text):
             return
 
         session.safety_review_in_progress = True
@@ -510,6 +586,13 @@ class SessionManager:
                 )
                 return
 
+            if assessment.reason == "caller_requests_staff" and not self._recent_transcript_has_staff_request(session.recent_transcript):
+                logger.info(
+                    "[SAFETY JUDGE] Ignoring caller_requests_staff without explicit staff request session=%s",
+                    session_id[:8],
+                )
+                return
+
             summary = assessment.office_summary or "AI safety judge requested manual office review based on the live call transcript."
             await self.send_office_handoff_email(
                 session_id=session_id,
@@ -540,6 +623,56 @@ class SessionManager:
             "repeated_misunderstanding",
             "caller_requests_staff",
         }
+
+    def _is_language_preference_only(self, customer_text: str) -> bool:
+        text = _normalize_for_match(customer_text)
+        compact = text.replace(".", "").strip()
+        return compact in {
+            "speak english",
+            "speaking english",
+            "english",
+            "english please",
+            "in english",
+            "deutsch",
+            "german",
+            "speak german",
+            "auf deutsch",
+            "francais",
+            "french",
+            "italian",
+            "spanish",
+            "turkish",
+            "arabic",
+            "kurdish",
+        }
+
+    def _recent_transcript_has_staff_request(self, transcript: List[Dict[str, Any]]) -> bool:
+        text = " ".join(
+            str(entry.get("utterance_text") or "")
+            for entry in transcript[-12:]
+            if entry.get("speaker") == "customer"
+        ).lower()
+        staff_phrases = (
+            "human",
+            "person",
+            "staff",
+            "reception",
+            "receptionist",
+            "office",
+            "team",
+            "callback",
+            "call back",
+            "call me",
+            "transfer",
+            "representative",
+            "mitarbeiter",
+            "praxis",
+            "rueckruf",
+            "rückruf",
+            "zurueckrufen",
+            "zurückrufen",
+        )
+        return any(phrase in text for phrase in staff_phrases)
     
     def get_session(self, session_id: str) -> Optional[CallSession]:
         """Get session by session ID."""
@@ -752,6 +885,22 @@ class SessionManager:
         if pending and pending.get("urgency") != "emergency":
             logger.info(f"[OFFICE HANDOFF] Clearing non-emergency queued handoff after successful booking for {session_id}")
             session.office_handoff_pending = None
+
+    def clear_recoverable_office_handoff(self, session_id: str, reason: str) -> bool:
+        """Clear a queued non-emergency handoff when the conversation later recovers."""
+        session = self.active_sessions.get(session_id)
+        if not session or not session.office_handoff_pending:
+            return False
+        pending = session.office_handoff_pending
+        if pending.get("urgency") == "emergency" or pending.get("reason") != reason:
+            return False
+        logger.info(
+            "[OFFICE HANDOFF] Clearing recoverable queued handoff for %s reason=%s",
+            session_id,
+            reason,
+        )
+        session.office_handoff_pending = None
+        return True
         
     def get_session_phonebook_info(self, session_id: str) -> Optional[Dict[str, Any]]:
         try:
@@ -786,26 +935,65 @@ class SessionManager:
                 "candidate_count": candidate_count,
             }
 
-        match = lookup.lookup_by_phone_and_name(caller_phone, first_name, last_name)
+        match, match_status = lookup.match_by_phone_and_name(caller_phone, first_name, last_name)
         if match:
             session.phonebook_match = match.to_dict()
+            plan = phonebook_booking_field_plan(session.phonebook_match)
+            if plan["must_ask"]:
+                collection_message = (
+                    f"Existing patient. Ask only for these missing fields: {', '.join(plan['must_ask'])}. "
+                    "Do not ask for anything in do_not_ask. Keep the name order the caller gave."
+                )
+            else:
+                collection_message = (
+                    "Existing patient. Date of birth and address are already on file. "
+                    "Do not ask for them. After the slot is confirmed, call book_appointment "
+                    "using the stored fields or omit them so the backend fills them. "
+                    "Keep the name order the caller gave."
+                )
             return {
                 "matched": True,
                 "is_new_patient": False,
-                "status": "matched",
+                "status": match_status,
                 "candidate_count": candidate_count,
+                "do_not_ask": plan["do_not_ask"],
+                "must_ask": plan["must_ask"],
                 "phonebook_match": _phonebook_for_model(session.phonebook_match),
+                "message": collection_message,
+            }
+
+        if match_status == "ambiguous_name_match":
+            return {
+                "matched": False,
+                "is_new_patient": False,
+                "status": "ambiguous_name_match",
+                "candidate_count": candidate_count,
+                "message": (
+                    "Several patients on this number fit the spoken name. Ask the caller to spell "
+                    "both first and last name letter by letter, then retry before treating them as new."
+                ),
             }
 
         fuzzy_candidates: List[Dict[str, Any]] = []
-        input_last = _normalize_for_match(last_name)
         for candidate in session.phonebook_candidates or []:
-            candidate_last = _normalize_for_match(candidate.get("last_name"))
-            if input_last and candidate_last and input_last != candidate_last:
-                continue
+            # Score both name orders — some records store Vorname/Nachname reversed,
+            # which previously hid genuine ASR mismatches from this check.
+            orientations = (
+                (
+                    False,
+                    _name_similarity(first_name, candidate.get("first_name")),
+                    _name_similarity(last_name, candidate.get("last_name")),
+                ),
+                (
+                    True,
+                    _name_similarity(first_name, candidate.get("last_name")),
+                    _name_similarity(last_name, candidate.get("first_name")),
+                ),
+            )
+            swapped_order, first_score, last_score = max(
+                orientations, key=lambda item: (item[2], item[1])
+            )
 
-            first_score = _name_similarity(first_name, candidate.get("first_name"))
-            last_score = _name_similarity(last_name, candidate.get("last_name"))
             if first_score >= 0.72 and last_score >= 0.90:
                 fuzzy_candidates.append(
                     {
@@ -813,6 +1001,7 @@ class SessionManager:
                         "last_name": candidate.get("last_name"),
                         "first_name_similarity": round(first_score, 3),
                         "last_name_similarity": round(last_score, 3),
+                        "name_order_swapped": swapped_order,
                     }
                 )
 
@@ -840,6 +1029,7 @@ class SessionManager:
             "matched": False,
             "is_new_patient": True,
             "status": "new_patient",
+            "name_match_status": match_status,
             "candidate_count": candidate_count,
             "message": "No existing patient matched all three fields: caller phone number, first name, and last name.",
         }

@@ -31,6 +31,23 @@ AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
 COGNITIVE_SERVICE_ENDPOINT = os.getenv("COGNITIVE_SERVICE_ENDPOINT")
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 AZURE_OPENAI_API_TYPE = os.getenv("AZURE_OPENAI_API_TYPE")
+AZURE_OPENAI_REALTIME_API_MODE = os.getenv("AZURE_OPENAI_REALTIME_API_MODE", "preview").strip().lower()
+AZURE_OPENAI_LIVE_TRANSCRIBE_DEPLOYMENT = os.getenv(
+    "AZURE_OPENAI_LIVE_TRANSCRIBE_DEPLOYMENT",
+    "",
+).strip()
+AZURE_OPENAI_TRANSCRIPTION_LANGUAGE = os.getenv(
+    "AZURE_OPENAI_TRANSCRIPTION_LANGUAGE",
+    "",
+).strip()
+AZURE_OPENAI_TRANSCRIPTION_PROMPT = os.getenv(
+    "AZURE_OPENAI_TRANSCRIPTION_PROMPT",
+    "",
+).strip()
+try:
+    AZURE_OPENAI_REALTIME_TEMPERATURE = float(os.getenv("AZURE_OPENAI_REALTIME_TEMPERATURE", "0.4"))
+except ValueError:
+    AZURE_OPENAI_REALTIME_TEMPERATURE = 0.4
 
 AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 
@@ -58,6 +75,12 @@ if not AZURE_OPENAI_ENDPOINT:
     ENV_VALIDATION_ERRORS.append("AZURE_OPENAI_ENDPOINT environment variable is required but not set")
 if not AZURE_OPENAI_DEPLOYMENT:
     ENV_VALIDATION_ERRORS.append("AZURE_OPENAI_DEPLOYMENT environment variable is required but not set")
+if AZURE_OPENAI_REALTIME_API_MODE not in {"ga", "preview"}:
+    ENV_VALIDATION_ERRORS.append("AZURE_OPENAI_REALTIME_API_MODE must be either 'ga' or 'preview'")
+if AZURE_OPENAI_REALTIME_API_MODE == "ga" and not AZURE_OPENAI_LIVE_TRANSCRIBE_DEPLOYMENT:
+    ENV_VALIDATION_ERRORS.append(
+        "AZURE_OPENAI_LIVE_TRANSCRIBE_DEPLOYMENT is required when AZURE_OPENAI_REALTIME_API_MODE=ga"
+    )
 if not ACS_CONNECTION_STRING:
     ENV_VALIDATION_ERRORS.append("ACS_CONNECTION_STRING environment variable is required but not set")
 if not COGNITIVE_SERVICE_ENDPOINT:
@@ -66,7 +89,7 @@ if not ACS_SOURCE_NUMBER:
     ENV_VALIDATION_ERRORS.append("ACS_SOURCE_NUMBER environment variable is required but not set")
 if not DEVTUNNEL_ID:
     ENV_VALIDATION_ERRORS.append("DEVTUNNEL_ID environment variable is required but not set")
-if not AZURE_OPENAI_API_VERSION:
+if AZURE_OPENAI_REALTIME_API_MODE == "preview" and not AZURE_OPENAI_API_VERSION:
     ENV_VALIDATION_ERRORS.append("AZURE_OPENAI_API_VERSION environment variable is required but not set")
 if not AZURE_OPENAI_API_TYPE:
     ENV_VALIDATION_ERRORS.append("AZURE_OPENAI_API_TYPE environment variable is required but not set")
@@ -113,6 +136,11 @@ def get_config() -> Dict[str, Any]:
         "azure_openai_key": AZURE_OPENAI_KEY,
         "azure_openai_api_version": AZURE_OPENAI_API_VERSION,
         "azure_openai_api_type": AZURE_OPENAI_API_TYPE,
+        "azure_openai_realtime_api_mode": AZURE_OPENAI_REALTIME_API_MODE,
+        "azure_openai_live_transcribe_deployment": AZURE_OPENAI_LIVE_TRANSCRIBE_DEPLOYMENT,
+        "azure_openai_transcription_language": AZURE_OPENAI_TRANSCRIPTION_LANGUAGE,
+        "azure_openai_transcription_prompt": AZURE_OPENAI_TRANSCRIPTION_PROMPT,
+        "azure_openai_realtime_temperature": AZURE_OPENAI_REALTIME_TEMPERATURE,
         "devtunnel_id": DEVTUNNEL_ID,
         "azure_openai_embedding_deployment": AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
         "azure_search_endpoint": AZURE_SEARCH_ENDPOINT,

@@ -1,13 +1,23 @@
 import json
 from datetime import datetime, timezone
-from openai.types.beta.realtime import (InputAudioBufferAppendEvent, SessionUpdateEvent)
-from openai.types.beta.realtime.session_update_event import Session, SessionTurnDetection
 from typing import Any, Literal, Optional
 import logging
 
 logger = logging.getLogger(__name__)
 
-def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_message: Optional[str], temperature: Optional[float], max_tokens: Optional[int], disable_audio: Optional[bool], voice: str) -> InputAudioBufferAppendEvent | SessionUpdateEvent | Any | None:
+def transform_acs_to_openai_format(
+    msg_data: Any,
+    model: Optional[str],
+    system_message: Optional[str],
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    disable_audio: Optional[bool],
+    voice: str,
+    realtime_api_mode: str = "preview",
+    transcription_model: str = "gpt-4o-transcribe",
+    transcription_language: str = "",
+    transcription_prompt: str = "",
+) -> Any | None:
     """
     Transforms websocket message data from Azure Communication Services (ACS) to the OpenAI Realtime API format.
     Args:
@@ -39,7 +49,7 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                     "silence_duration_ms": 800
                 },
                 "input_audio_transcription": {
-                  "model": "gpt-4o-transcribe",
+                  "model": transcription_model or "gpt-4o-transcribe",
                 },
                 "input_audio_noise_reduction": {
                     "type": "far_field"
@@ -87,7 +97,7 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                     {
                         "type": "function",
                         "name": "resolve_phonebook_identity",
-                        "description": "After the caller confirms their first and last name, determine whether this caller is an existing patient. Existing patient requires caller phone number, first name, and last name. If the result status is possible_name_asr_mismatch, ask the caller to spell the first name letter by letter and retry with the corrected spelling before treating them as new.",
+                        "description": "After the caller confirms their first and last name, determine whether this caller is an existing patient. Existing patient requires caller phone number, first name, and last name. Any status starting with 'matched' means the caller is an existing patient: treat them as known, keep the name order the caller gave, and never ask them to repeat or spell the name. If do_not_ask includes date_of_birth or address, never ask the caller for those fields again — pass the returned phonebook values into book_appointment or omit them so the backend fills them. Ask only fields listed in must_ask. If the status is possible_name_asr_mismatch, ask the caller to spell the first name letter by letter and retry with the corrected spelling before treating them as new. If the status is ambiguous_name_match, ask the caller to spell both first and last name and retry.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -100,7 +110,7 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                     {
                         "type": "function",
                         "name": "book_appointment",
-                        "description": "Book an appointment for a patient after the caller has confirmed the appointment slot and the required EPAAD patient fields. Required fields are full name, date of birth, telephone number, and address. Do not ask for insurance card number or email during the call.",
+                        "description": "Book an appointment after the caller has confirmed the slot. If resolve_phonebook_identity already returned date of birth or address, do not ask the caller again — pass those stored values or omit the parameters so the backend fills them. Ask the caller only for fields listed in must_ask. Never ask for insurance card number or email during the call.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -108,20 +118,20 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
                                 "slot_iso": {"type": "string", "description": "The exact ISO datetime slot chosen by the patient."},
                                 "patient_first_name": {"type": "string", "description": "Patient first name in Latin characters only. Transliterate from Arabic, Chinese, Cyrillic, etc. before calling."},
                                 "patient_last_name": {"type": "string", "description": "Patient last name in Latin characters only. Transliterate from Arabic, Chinese, Cyrillic, etc. before calling."},
-                                "patient_dob": {"type": "string", "description": "Patient's Date of Birth in YYYY-MM-DD format."},
+                                "patient_dob": {"type": "string", "description": "Patient date of birth in YYYY-MM-DD format. If already returned by resolve_phonebook_identity, pass that value or omit this parameter. Do not ask the caller again."},
                                 "patient_phone": {"type": "string", "description": "Optional. The backend uses the incoming ACS caller number automatically. Do not ask the caller for it."},
                                 "patient_gender": {"type": "string", "enum": ["male", "female", "other"], "description": "Patient's gender. Detect automatically from the caller's voice (male vs female voice characteristics). Do NOT ask the patient. Use 'male' for clearly male voices, 'female' for clearly female voices, 'other' only when voice is completely ambiguous."},
                                 "patient_email": {"type": "string", "description": "Optional. Use only if already known from trusted phonebook data or volunteered by the caller. Do not ask for it during normal booking."},
-                                "street": {"type": "string", "description": "Patient's street name. Required by EPAAD. Ask the caller if not already known from a verified phonebook match."},
-                                "street_number": {"type": "string", "description": "Patient's house/street number. Required by EPAAD. Ask the caller if not already known from a verified phonebook match."},
-                                "zip_code": {"type": "string", "description": "Patient's postal/zip code. Required by EPAAD. Ask the caller if not already known from a verified phonebook match."},
-                                "city": {"type": "string", "description": "Patient's city. Required by EPAAD. Ask the caller if not already known from a verified phonebook match."},
+                                "street": {"type": "string", "description": "Patient street name. If already returned by a verified phonebook match, pass that value or omit this parameter. Do not ask the caller again."},
+                                "street_number": {"type": "string", "description": "Patient house/street number. If already returned by a verified phonebook match, pass that value or omit this parameter. Do not ask the caller again."},
+                                "zip_code": {"type": "string", "description": "Patient postal/zip code. If already returned by a verified phonebook match, pass that value or omit this parameter. Do not ask the caller again."},
+                                "city": {"type": "string", "description": "Patient city. If already returned by a verified phonebook match, pass that value or omit this parameter. Do not ask the caller again."},
                                 "visit_reason": {"type": "string", "description": "The reason for the visit as described by the patient. Used to determine appointment duration."},
                                 "comment": {"type": "string", "description": "Additional notes or comments for the appointment."}
                             },
                             "required": [
-                                "calendar_id", "slot_iso", "patient_first_name", "patient_last_name", 
-                                "patient_dob", "street", "street_number", "zip_code", "city", "visit_reason"
+                                "calendar_id", "slot_iso", "patient_first_name", "patient_last_name",
+                                "visit_reason"
                             ]
                         }
                     },
@@ -176,6 +186,48 @@ def transform_acs_to_openai_format(msg_data: Any, model: Optional[str], system_m
         if disable_audio is not None:
             oai_message["session"]["disable_audio"] = disable_audio
 
+        if realtime_api_mode == "ga":
+            legacy_session = oai_message["session"]
+            transcription = {"model": transcription_model}
+            if transcription_language:
+                transcription["language"] = transcription_language
+            if transcription_prompt:
+                transcription["prompt"] = transcription_prompt
+
+            ga_session = {
+                "type": "realtime",
+                "instructions": legacy_session.get("instructions", ""),
+                "output_modalities": ["audio"],
+                "parallel_tool_calls": False,
+                "include": ["item.input_audio_transcription.logprobs"],
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "transcription": transcription,
+                        "noise_reduction": {"type": "near_field"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 500,
+                            "create_response": True,
+                            "interrupt_response": True,
+                        },
+                    },
+                    "output": {
+                        "voice": voice,
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                    },
+                },
+                "tools": legacy_session.get("tools", []),
+                "tool_choice": legacy_session.get("tool_choice", "auto"),
+            }
+            if temperature is not None:
+                ga_session["temperature"] = temperature
+            if max_tokens is not None:
+                ga_session["max_output_tokens"] = max_tokens
+            oai_message["session"] = ga_session
+
 
     elif msg_data["kind"] == "AudioData":
         oai_message = {
@@ -202,7 +254,7 @@ def transform_openai_to_acs_format(msg_data: Any) -> Optional[Any]:
     
     # Message from the OpenAI Realtime API with audio data.
     # Transform the message to the Azure Communication Services format.
-    if msg_data["type"] == "response.audio.delta":
+    if msg_data.get("type") in {"response.audio.delta", "response.output_audio.delta"}:
         acs_message = {
             "kind": "AudioData",
             "audioData": {
@@ -232,21 +284,29 @@ def extract_transcription_from_openai_message(msg_data: Any) -> Optional[dict]:
         pass  # Speech start handled in rtmt.py
     elif msg_data.get("type") == "input_audio_buffer.committed":
         pass  # Speech stop handled in rtmt.py
-    elif msg_data.get("type") == "conversation.item.input_audio_transcription.completed":
-        transcript = msg_data.get("transcript", "")
+    elif msg_data.get("type") in {
+        "conversation.item.input_audio_transcription.completed",
+        "conversation.item.audio_transcription.completed",
+    }:
+        transcript = msg_data.get("transcript") or msg_data.get("text", "")
         if transcript:
             transcription_data = {
                 "speaker": "customer",
                 "utterance_text": transcript,
                 "timestamp": current_time,
+                "source": "input_audio_transcription",
             }
-    elif msg_data.get("type") == "response.audio_transcript.done":
-        transcript = msg_data.get("transcript", "")
+    elif msg_data.get("type") in {
+        "response.audio_transcript.done",
+        "response.output_audio_transcript.done",
+    }:
+        transcript = msg_data.get("transcript") or msg_data.get("text", "")
         if transcript:
             transcription_data = {
                 "speaker": "agent",
                 "utterance_text": transcript,
-                "timestamp": current_time
+                "timestamp": current_time,
+                "source": "realtime_agent",
             }
     
     elif msg_data.get("type") == "response.content_part.added":

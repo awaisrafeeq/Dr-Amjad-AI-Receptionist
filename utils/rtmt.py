@@ -1,5 +1,6 @@
 import aiohttp
 import asyncio
+import array
 import base64
 import json
 from json import JSONDecodeError
@@ -19,7 +20,7 @@ import asyncio
 import logging
 from difflib import SequenceMatcher
 # Import here to avoid circular imports
-from utils.session_manager import session_manager
+from utils.session_manager import session_manager, verified_patient_instruction
 from utils.document_utils import document_processor
 from utils.epaad_client import epaad_client
 from utils.availability import build_next_available_recommendation, build_slot_recommendation, compute_free_slots, default_opening_hours
@@ -32,6 +33,7 @@ except Exception:  # pragma: no cover
 import os
 import re
 import unicodedata
+from urllib.parse import quote
 from datetime import date, datetime, timedelta, timezone
 try:
     from zoneinfo import ZoneInfo
@@ -42,6 +44,82 @@ config = get_config()
 logger = logging.getLogger(__name__)
 
 _LATIN_NAME_EXTRA_CHARS = set(" -'.`´’")
+
+
+class VoiceGenderEstimator:
+    """Small in-memory pitch estimator for caller audio. Raw audio is not stored."""
+
+    def __init__(self, sample_rate: int = 24000):
+        self.sample_rate = sample_rate
+        self.frame_samples = max(400, int(sample_rate * 0.03))
+        self.buffer = bytearray()
+        self.pitch_estimates: List[float] = []
+        self.max_estimates = 50
+
+    def add_audio(self, raw_audio: bytes) -> None:
+        if len(self.pitch_estimates) >= self.max_estimates:
+            return
+        self.buffer.extend(raw_audio)
+        frame_bytes = self.frame_samples * 2
+        while len(self.buffer) >= frame_bytes and len(self.pitch_estimates) < self.max_estimates:
+            frame = bytes(self.buffer[:frame_bytes])
+            del self.buffer[:frame_bytes]
+            pitch = self._estimate_pitch(frame)
+            if pitch:
+                self.pitch_estimates.append(pitch)
+
+    def classification(self) -> str:
+        if len(self.pitch_estimates) < 8:
+            return "other"
+        values = sorted(self.pitch_estimates)
+        median = values[len(values) // 2]
+        if median < 165:
+            return "male"
+        if median > 185:
+            return "female"
+        return "other"
+
+    def confidence(self) -> float:
+        if len(self.pitch_estimates) < 8:
+            return 0.0
+        values = sorted(self.pitch_estimates)
+        median = values[len(values) // 2]
+        distance = min(abs(median - 165), abs(median - 185))
+        return round(min(0.95, 0.45 + (distance / 80)), 2)
+
+    def _estimate_pitch(self, frame: bytes) -> Optional[float]:
+        samples = array.array("h")
+        samples.frombytes(frame)
+        if not samples:
+            return None
+        mean = sum(samples) / len(samples)
+        centered = [sample - mean for sample in samples]
+        energy = sum(sample * sample for sample in centered) / len(centered)
+        if energy < 90000:
+            return None
+
+        min_lag = max(1, int(self.sample_rate / 300))
+        max_lag = min(len(centered) // 2, int(self.sample_rate / 75))
+        if max_lag <= min_lag:
+            return None
+
+        best_lag = 0
+        best_score = 0.0
+        base_energy = sum(sample * sample for sample in centered)
+        if base_energy <= 0:
+            return None
+
+        for lag in range(min_lag, max_lag + 1):
+            score = 0.0
+            for idx in range(len(centered) - lag):
+                score += centered[idx] * centered[idx + lag]
+            if score > best_score:
+                best_score = score
+                best_lag = lag
+
+        if not best_lag or best_score / base_energy < 0.25:
+            return None
+        return self.sample_rate / best_lag
 
 
 def _is_latin_name(value: Optional[str]) -> bool:
@@ -61,6 +139,135 @@ def _is_latin_name(value: Optional[str]) -> bool:
         return False
     return True
 
+
+def _is_missing(value: Any) -> bool:
+    return value is None or str(value).strip() in {"", "MISSING", "[REDACTED]", "null", "None"}
+
+
+def _normalize_dob_for_epaad(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text == "MISSING":
+        return ""
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d.%m.%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%dT00:00:00")
+        except ValueError:
+            continue
+    return ""
+
+
+def _parse_spoken_number(value: Any) -> Optional[int]:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    normalized = unicodedata.normalize("NFKD", text)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    compact = re.sub(r"[^a-z]", "", normalized)
+    if not compact:
+        return None
+
+    units = {
+        "ein": 1, "eins": 1, "eine": 1, "zwei": 2, "drei": 3, "vier": 4,
+        "funf": 5, "fuenf": 5, "sechs": 6, "sieben": 7, "acht": 8, "neun": 9,
+    }
+    teens = {
+        "zehn": 10, "elf": 11, "zwolf": 12, "zwoelf": 12, "dreizehn": 13,
+        "vierzehn": 14, "funfzehn": 15, "fuenfzehn": 15, "sechzehn": 16,
+        "siebzehn": 17, "achtzehn": 18, "neunzehn": 19,
+    }
+    tens = {
+        "zwanzig": 20, "dreissig": 30, "dreisig": 30, "vierzig": 40,
+        "funfzig": 50, "fuenfzig": 50, "sechzig": 60, "siebzig": 70,
+        "achtzig": 80, "neunzig": 90,
+    }
+
+    def parse_under_100(part: str) -> Optional[int]:
+        if not part:
+            return 0
+        if part in units:
+            return units[part]
+        if part in teens:
+            return teens[part]
+        if part in tens:
+            return tens[part]
+        if "und" in part:
+            unit_text, ten_text = part.split("und", 1)
+            if unit_text in units and ten_text in tens:
+                return units[unit_text] + tens[ten_text]
+        return None
+
+    total = 0
+    rest = compact
+    if rest.startswith("hundert"):
+        total = 100
+        rest = rest[len("hundert"):]
+    else:
+        for unit_text, unit_value in sorted(units.items(), key=lambda item: len(item[0]), reverse=True):
+            marker = f"{unit_text}hundert"
+            if rest.startswith(marker):
+                total = unit_value * 100
+                rest = rest[len(marker):]
+                break
+
+    parsed_rest = parse_under_100(rest)
+    if parsed_rest is not None:
+        return total + parsed_rest
+
+    english = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+        "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+        "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+        "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+        "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+        "seventy": 70, "eighty": 80, "ninety": 90, "hundred": 100,
+    }
+    tokens = [token for token in re.split(r"[^a-z]+", normalized) if token]
+    if tokens and all(token in english for token in tokens):
+        total = 0
+        current = 0
+        for token in tokens:
+            value = english[token]
+            if token == "hundred":
+                current = max(current, 1) * 100
+            else:
+                current += value
+        total += current
+        return total or None
+    return None
+
+
+def _normalize_street_number_for_epaad(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text == "MISSING":
+        return ""
+    normalized = unicodedata.normalize("NFKD", text)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = normalized.lower().replace("-", " ")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if re.search(r"\d", normalized):
+        return re.sub(r"\s+", "", normalized).upper()
+    tokens = normalized.split()
+    suffix = ""
+    if tokens and len(tokens[-1]) == 1 and tokens[-1].isalpha():
+        suffix = tokens.pop(-1).upper()
+    parsed = _parse_spoken_number(" ".join(tokens))
+    if parsed is not None:
+        return f"{parsed}{suffix}"
+    return text
+
+
+def _split_street_and_number(street: Any, street_number: Any) -> Tuple[str, str]:
+    street_text = "" if _is_missing(street) else str(street).strip()
+    number_text = "" if _is_missing(street_number) else str(street_number).strip()
+    if street_text and not number_text:
+        match = re.match(r"^(.*?)[,\s]+(\d+\s*[a-zA-Z]?)$", street_text)
+        if match:
+            street_text = match.group(1).strip()
+            number_text = match.group(2).strip()
+    return street_text, _normalize_street_number_for_epaad(number_text)
+
 class RTMiddleTier:
     
     endpoint: str
@@ -78,10 +285,15 @@ class RTMiddleTier:
     disable_audio: Optional[bool] = None
     
     def __init__(self):
-        self.endpoint = config["azure_openai_endpoint"]
+        self.endpoint = (config["azure_openai_endpoint"] or "").rstrip("/")
         self.deployment = config["azure_openai_deployment"]
         self.api_version = config["azure_openai_api_version"]
         self.key = config["azure_openai_key"]
+        self.realtime_api_mode = config["azure_openai_realtime_api_mode"]
+        self.live_transcribe_deployment = config["azure_openai_live_transcribe_deployment"]
+        self.transcription_language = config["azure_openai_transcription_language"]
+        self.transcription_prompt = config["azure_openai_transcription_prompt"]
+        self.temperature = config["azure_openai_realtime_temperature"]
 
         self.selected_voice = "coral"
         self._prompt_path = "system_prompt.md"
@@ -133,11 +345,28 @@ class RTMiddleTier:
     async def forward_messages(self, ws: WebSocket, is_acs_audio_stream: bool, session_id: Optional[str] = None):
         self._refresh_prompt_if_changed()
         async with aiohttp.ClientSession(base_url=self.endpoint) as session:
-            headers = {
-                "api-key": self.key,
-                "OpenAI-Beta": "realtime=v1",
-            }
-            ws_url = f"/openai/realtime?api-version={self.api_version}&deployment={self.deployment}"
+            headers = {"api-key": self.key}
+            if self.realtime_api_mode == "ga":
+                ws_url = f"/openai/v1/realtime?model={quote(self.deployment or '', safe='')}"
+            else:
+                headers["OpenAI-Beta"] = "realtime=v1"
+                ws_url = (
+                    f"/openai/realtime?api-version={quote(self.api_version or '', safe='')}"
+                    f"&deployment={quote(self.deployment or '', safe='')}"
+                )
+
+            logger.info(
+                "[OPENAI REALTIME] mode=%s agent=%s transcription=%s endpoint=%s",
+                self.realtime_api_mode,
+                self.deployment,
+                self.live_transcribe_deployment or "preview-default",
+                self.endpoint,
+            )
+            if self.realtime_api_mode == "ga" and ".services.ai.azure.com" in self.endpoint.lower():
+                logger.warning(
+                    "[OPENAI REALTIME] AZURE_OPENAI_ENDPOINT looks like a Foundry project endpoint. "
+                    "Use the Azure OpenAI resource endpoint ending in .openai.azure.com for /openai/v1/realtime."
+                )
             
             try:
                 # logger.info("Connecting to Azure OpenAI Realtime: %s%s", self.endpoint, ws_url)
@@ -153,8 +382,13 @@ class RTMiddleTier:
                     response_idle_event.set()  # Start in idle state
 
                     last_user_activity_ts = loop.time()
+                    _call_start_ts = loop.time()
+                    _first_audio_sent = False
                     last_prompt_stage = 0
+                    _prompt1_fire_count = 0
                     detected_conversation_language: Optional[str] = "de"
+                    language_locked = False
+                    pending_language_confirmation: Optional[str] = None
                     _phonebook_context = ""
 
                     last_kb_context: Optional[str] = None
@@ -173,6 +407,9 @@ class RTMiddleTier:
 
                     # Cache calendars for this session to avoid duplicate API calls
                     _session_calendars: Optional[list] = None
+                    _gender_estimator = VoiceGenderEstimator(24000)
+                    _missing_booking_field_attempts: Dict[str, int] = {}
+                    recent_customer_utterances: List[str] = []
 
                     # Transcription batching queue for async logging
                     _transcription_batch: list = []
@@ -231,17 +468,39 @@ class RTMiddleTier:
 
                     def _language_session_hint() -> str:
                         _lang = detected_conversation_language or "de"
+                        if pending_language_confirmation and not language_locked:
+                            return (
+                                "[CURRENT CALL LANGUAGE]\n"
+                                "Start and continue in German for now. The caller may prefer "
+                                f"{_language_name(pending_language_confirmation)}. Ask one short confirmation question: "
+                                f"whether they prefer German or {_language_name(pending_language_confirmation)}. "
+                                "Do not switch until the caller confirms the language preference. "
+                                "After confirmation, stay in that language for the rest of the call."
+                            )
                         if _lang == "ku":
                             return (
                                 "[CURRENT CALL LANGUAGE]\n"
                                 "The caller requested Kurdish. Ask once whether they prefer Kurmanji or Sorani, "
                                 "then continue only in the confirmed dialect."
                             )
+                        if language_locked:
+                            return (
+                                "[CURRENT CALL LANGUAGE]\n"
+                                f"The conversation language is locked to {_language_name(_lang)}. "
+                                f"Use {_language_name(_lang)} for all spoken responses, holding prompts, and goodbye messages. "
+                                "Do not switch languages again during this call."
+                            )
                         return (
                             "[CURRENT CALL LANGUAGE]\n"
-                            f"Use {_language_name(_lang)} for all spoken responses, holding prompts, and goodbye messages. "
-                            "Do not switch languages unless the caller clearly requests it."
+                            "Start in German. If the caller speaks German, stay in German and lock German for the call. "
+                            "If the caller appears to use another supported language, ask their preference once before switching. "
+                            "Do not switch language from short, noisy, or ambiguous fragments."
                         )
+
+                    # Languages the live transcription model reliably supports as an
+                    # explicit hint. Kurdish variants are left on auto-detect since
+                    # their dialect codes aren't standard ASR language identifiers.
+                    _ASR_HINTABLE_LANGUAGES = {"de", "en", "fr", "it", "es", "tr", "ar"}
 
                     async def update_session_language_hint(reason: str) -> None:
                         try:
@@ -249,22 +508,85 @@ class RTMiddleTier:
                             if _phonebook_context:
                                 _parts.append(_phonebook_context)
                             _parts.append(_language_session_hint())
+                            _session_payload = {"instructions": "\n\n".join(part for part in _parts if part)}
+                            if self.realtime_api_mode == "ga":
+                                _session_payload["type"] = "realtime"
+                                # Once the caller's language is locked, tell the ASR model
+                                # explicitly instead of leaving it to guess per utterance —
+                                # this is what was causing transcripts to randomly flip into
+                                # the wrong script (Arabic/Cyrillic/etc.) mid-call.
+                                if language_locked and detected_conversation_language in _ASR_HINTABLE_LANGUAGES:
+                                    _session_payload["audio"] = {
+                                        "input": {"transcription": {"language": detected_conversation_language}}
+                                    }
                             await target_ws.send_str(
                                 _json_dumps({
                                     "type": "session.update",
-                                    "session": {"instructions": "\n\n".join(part for part in _parts if part)}
+                                    "session": _session_payload
                                 })
                             )
                             logger.info(f"[LANG] Session language hint updated ({reason}): {detected_conversation_language}")
                         except Exception as _lang_update_err:
                             logger.debug(f"[LANG] Could not update session language hint: {_lang_update_err}")
 
-                    async def set_conversation_language(_lang: str, reason: str) -> None:
-                        nonlocal detected_conversation_language
-                        if _lang and _lang != detected_conversation_language:
+                    async def apply_verified_patient_context(resolution: Dict[str, Any]) -> None:
+                        nonlocal _phonebook_context
+                        _match = _resolved_phonebook_match() or {}
+                        _phonebook_context = verified_patient_instruction(
+                            _match,
+                            str(resolution.get("status") or "matched"),
+                        )
+                        try:
+                            _parts = [self.system_message or ""]
+                            _parts.append(_phonebook_context)
+                            _parts.append(_language_session_hint())
+                            _session_payload = {"instructions": "\n\n".join(part for part in _parts if part)}
+                            if self.realtime_api_mode == "ga":
+                                _session_payload["type"] = "realtime"
+                            await target_ws.send_str(
+                                _json_dumps({
+                                    "type": "session.update",
+                                    "session": _session_payload
+                                })
+                            )
+                            logger.info(
+                                "[PHONEBOOK] Verified-patient context injected do_not_ask=%s must_ask=%s",
+                                resolution.get("do_not_ask"),
+                                resolution.get("must_ask"),
+                            )
+                        except Exception as _verified_err:
+                            logger.warning(f"[PHONEBOOK] Failed to inject verified-patient context: {_verified_err}")
+
+                    async def set_conversation_language(_lang: str, reason: str, lock: bool = True) -> None:
+                        nonlocal detected_conversation_language, language_locked, pending_language_confirmation
+                        if not _lang:
+                            return
+                        if language_locked and _lang != detected_conversation_language:
+                            logger.info(
+                                "[LANG] Ignoring switch to %s (%s); language locked to %s",
+                                _lang,
+                                reason,
+                                detected_conversation_language,
+                            )
+                            return
+                        if _lang != detected_conversation_language:
                             detected_conversation_language = _lang
                             logger.info(f"[LANG] Switched to {_lang} ({reason})")
-                            await update_session_language_hint(reason)
+                        if lock:
+                            language_locked = True
+                            pending_language_confirmation = None
+                            logger.info(f"[LANG] Locked to {_lang} ({reason})")
+                        await update_session_language_hint(reason)
+
+                    async def request_language_confirmation(_lang: str, reason: str) -> None:
+                        nonlocal pending_language_confirmation
+                        if not _lang or language_locked or _lang == "de":
+                            return
+                        if pending_language_confirmation == _lang:
+                            return
+                        pending_language_confirmation = _lang
+                        logger.info(f"[LANG] Confirmation requested for {_lang} ({reason}); staying in German")
+                        await update_session_language_hint(reason)
 
                     def _detect_kurdish_language(text: str) -> Optional[str]:
                         if any(phrase in text for phrase in ["sorani", "soranî", "سۆرانی", "سورانی"]):
@@ -292,9 +614,17 @@ class RTMiddleTier:
                                 return False
 
                             try:
+                                response_payload = dict(response)
+                                if self.realtime_api_mode == "ga":
+                                    modalities = response_payload.pop("modalities", None)
+                                    response_payload.pop("voice", None)
+                                    if modalities:
+                                        response_payload["output_modalities"] = [
+                                            modality for modality in modalities if modality == "audio"
+                                        ] or ["audio"]
                                 await target_ws.send_str(_json_dumps({
                                     "type": "response.create",
-                                    "response": response,
+                                    "response": response_payload,
                                 }))
                                 # Set eagerly. OpenAI will later confirm with response.created,
                                 # but this prevents another local task from starting overlapping audio.
@@ -484,16 +814,20 @@ class RTMiddleTier:
                                         "This is not a confirmed patient match.",
                                         "After the caller confirms both first name and last name, call resolve_phonebook_identity.",
                                         "Only use stored patient details if resolve_phonebook_identity returns matched=true.",
-                                        "If it returns matched=false, treat the caller as a new patient and collect all required details.",
+                                        "Candidate names are shown as stored; the two name fields may be in reverse order or hold a longer official name, so do not re-ask a name just because it looks different.",
+                                        "Treat the caller as a new patient only if it returns matched=false together with is_new_patient=true.",
                                         "NEVER mention this data to the caller. NEVER say their name first.",
                                     ]
                                     _phonebook_context = "\n".join(_pb_lines)
+                                    _greeting_session_payload = {
+                                        "instructions": (self.system_message or "") + "\n\n" + _phonebook_context + "\n\n" + _language_session_hint()
+                                    }
+                                    if self.realtime_api_mode == "ga":
+                                        _greeting_session_payload["type"] = "realtime"
                                     await target_ws.send_str(
                                         _json_dumps({
                                             "type": "session.update",
-                                            "session": {
-                                                "instructions": (self.system_message or "") + "\n\n" + _phonebook_context + "\n\n" + _language_session_hint()
-                                            }
+                                            "session": _greeting_session_payload
                                         })
                                     )
                                     logger.info(f"[PHONEBOOK] Injected {len(_pb_candidates)} candidate(s) for identity resolution")
@@ -529,7 +863,7 @@ class RTMiddleTier:
                         logger.debug("Greeting triggered")
 
                     async def inactivity_monitor() -> None:
-                        nonlocal last_prompt_stage, last_user_activity_ts
+                        nonlocal last_prompt_stage, last_user_activity_ts, _prompt1_fire_count
                         if not is_acs_audio_stream:
                             return
 
@@ -592,11 +926,39 @@ class RTMiddleTier:
 
                                 if idle_for >= prompt_1_after and last_prompt_stage < 1:
                                     last_prompt_stage = 1
-                                    await send_assistant_prompt(
-                                        f"{_lang_instruction}"
-                                        "Say one short sentence such as: 'Please give me a moment, I am still here.' "
-                                        "Use the caller's current language. Do not ask a new workflow question."
-                                    )
+                                    # This counter never resets when speech fragments bump last_prompt_stage
+                                    # back to 0, so a caller who keeps trailing off mid-sentence doesn't hear
+                                    # the exact same "please wait" line on a loop for minutes.
+                                    _prompt1_fire_count += 1
+
+                                    if _prompt1_fire_count >= 6:
+                                        logger.info(
+                                            f"[INACTIVITY] Stage-1 prompt repeated {_prompt1_fire_count}x without a "
+                                            f"completed turn — ending call for session={session_id}"
+                                        )
+                                        await send_assistant_prompt(
+                                            f"{_lang_instruction}"
+                                            "Tell the caller the connection seems unclear, apologize, say they can "
+                                            "call back anytime, and say goodbye."
+                                        )
+                                        call_end_requested.set()
+                                        await asyncio.sleep(2.0)
+                                        _hung = await _do_acs_hangup("inactivity_stuck")
+                                        if not _hung:
+                                            logger.error("[INACTIVITY] Stuck-loop hangup failed — call may remain connected")
+                                        return
+                                    elif _prompt1_fire_count >= 3:
+                                        await send_assistant_prompt(
+                                            f"{_lang_instruction}"
+                                            "The caller's sentences keep trailing off before finishing. Politely ask "
+                                            "them to say their request again in one complete sentence."
+                                        )
+                                    else:
+                                        await send_assistant_prompt(
+                                            f"{_lang_instruction}"
+                                            "Say one short sentence such as: 'Please give me a moment, I am still here.' "
+                                            "Use the caller's current language. Do not ask a new workflow question."
+                                        )
                                     continue
 
                         except asyncio.CancelledError:
@@ -651,18 +1013,40 @@ class RTMiddleTier:
 
                                     if kind == "AudioData":
                                         last_user_activity_ts = loop.time()
+                                        try:
+                                            _audio_b64 = (data.get("audioData") or {}).get("data")
+                                            if _audio_b64:
+                                                _gender_estimator.add_audio(base64.b64decode(_audio_b64))
+                                        except Exception:
+                                            pass
 
                                 if is_acs_audio_stream:
-                                    data = transform_acs_to_openai_format(data, self.model, self.system_message, self.temperature, self.max_tokens, self.disable_audio, self.selected_voice)
+                                    data = transform_acs_to_openai_format(
+                                        data,
+                                        self.model,
+                                        self.system_message,
+                                        self.temperature,
+                                        self.max_tokens,
+                                        self.disable_audio,
+                                        self.selected_voice,
+                                        realtime_api_mode=self.realtime_api_mode,
+                                        transcription_model=self.live_transcribe_deployment,
+                                        transcription_language=self.transcription_language,
+                                        transcription_prompt=self.transcription_prompt,
+                                    )
                                 if data:
                                     if isinstance(data, dict) and data.get("type") == "session.update":
                                         session_initialized.set()
                                     await target_ws.send_str(_json_dumps(data))
+                            logger.info(
+                                f"[LOOP EXIT] from_client_to_server ended (ACS side closed) session={session_id} "
+                                f"ws_closed={ws.client_state.name if hasattr(ws.client_state, 'name') else ws.client_state}"
+                            )
                         except asyncio.CancelledError:
                             logger.debug("Client→server cancelled")
                             return
                         except Exception as e:
-                            logger.exception("Client→server error")
+                            logger.exception(f"[LOOP EXIT] from_client_to_server error (ACS side) session={session_id}: {e}")
                             return
                             
                     # --- TURN DETECTION CONFIGURATION ---
@@ -675,7 +1059,7 @@ class RTMiddleTier:
                     async def from_server_to_client():
                         nonlocal last_user_activity_ts, last_prompt_stage, session_id, detected_conversation_language
                         nonlocal suppress_agent_audio, cancel_sent_for_current_turn, response_active, speech_stop_time, unsuppress_scheduled
-                        nonlocal _transcription_flush_task
+                        nonlocal _transcription_flush_task, _first_audio_sent
                         try:
                             async for msg in target_ws:
                                 if msg.type == aiohttp.WSMsgType.TEXT:
@@ -688,7 +1072,7 @@ class RTMiddleTier:
                                         if _err_code == "response_cancel_not_active":
                                             logger.debug(f"[OPENAI] response_cancel_not_active (expected)")
                                         else:
-                                            logger.error(f"[OPENAI ERROR] {_err_code}: {original_data.get('error', {}).get('message', 'Unknown error')}")
+                                            logger.error(f"[OPENAI ERROR] session={session_id} {_err_code}: {original_data.get('error', {}).get('message', 'Unknown error')}")
                                     
                                     # Track response state (debug only)
                                     if event_type == "response.created":
@@ -701,8 +1085,29 @@ class RTMiddleTier:
                                         logger.debug("Response ended")
                                     
                                     elif event_type == "session.updated":
-                                        logger.debug("Session updated — transcription active")
+                                        _session_data = original_data.get("session") or {}
+                                        _audio_input = ((_session_data.get("audio") or {}).get("input") or {})
+                                        _transcription = (
+                                            _audio_input.get("transcription")
+                                            or _session_data.get("input_audio_transcription")
+                                            or {}
+                                        )
+                                        logger.info(
+                                            "[OPENAI REALTIME] Session configured agent=%s transcription=%s",
+                                            self.deployment,
+                                            _transcription.get("model") or self.live_transcribe_deployment or "unknown",
+                                        )
                                         session_confirmed.set()
+
+                                    elif event_type in {
+                                        "conversation.item.input_audio_transcription.failed",
+                                        "conversation.item.audio_transcription.failed",
+                                    }:
+                                        logger.error(
+                                            "[TRANSCRIPTION FAILED] model=%s error=%s",
+                                            self.live_transcribe_deployment or "unknown",
+                                            original_data.get("error") or original_data,
+                                        )
 
                                     elif event_type == "response.function_call_arguments.done":
                                         _call_id = original_data.get("call_id")
@@ -839,6 +1244,145 @@ class RTMiddleTier:
                                                     _session_calendars = await epaad_client.get_calendars()
                                                 return _session_calendars
 
+                                            async def _missing_booking_field_response(__missing_fields: List[str]) -> str:
+                                                if not __missing_fields:
+                                                    return _json_dumps({"status": "error", "message": "Missing-field guard called without missing fields."})
+
+                                                __first_missing = __missing_fields[0]
+                                                __attempt = _missing_booking_field_attempts.get(__first_missing, 0) + 1
+                                                _missing_booking_field_attempts[__first_missing] = __attempt
+                                                __max_attempts = 3
+
+                                                if __attempt >= __max_attempts:
+                                                    logger.info(
+                                                        "[BOOKING BLOCKED] repeated missing field; queueing office handoff field=%s session=%s",
+                                                        __first_missing,
+                                                        session_id,
+                                                    )
+                                                    if session_id:
+                                                        await session_manager.send_office_handoff_email(
+                                                            session_id=session_id,
+                                                            reason="other",
+                                                            summary=f"Booking could not continue because required field '{__first_missing}' remained missing or invalid after repeated attempts.",
+                                                            urgency="routine",
+                                                        )
+                                                    return _json_dumps(
+                                                        {
+                                                            "status": "booking_failed",
+                                                            "reason": "missing_required_field_repeated",
+                                                            "missing_required_fields": __missing_fields,
+                                                            "message": "A required booking field remained missing or invalid after repeated attempts.",
+                                                            "instruction": "Do not say the appointment is booked. Tell the caller the office team will review the request.",
+                                                        }
+                                                    )
+
+                                                __field_questions = {
+                                                    "patient_dob": "Ask only for the caller's date of birth.",
+                                                    "patient_dob_confirmation": "Repeat the date of birth you understood and ask the caller to say the complete date again. Do not guess the year.",
+                                                    "street": "Ask only for the street name.",
+                                                    "street_number": "Ask only for the house or street number. If they say it in words, convert it to digits before retrying.",
+                                                    "zip_code": "Ask only for the postal or zip code.",
+                                                    "city": "Ask only for the city.",
+                                                    "visit_reason": "Ask only for the appointment reason.",
+                                                    "address_confirmation": "Ask the caller to repeat the complete address once. Then retry booking using only the address the caller just spoke.",
+                                                }
+                                                return _json_dumps(
+                                                    {
+                                                        "status": "missing_required_booking_fields",
+                                                        "missing_required_fields": __missing_fields,
+                                                        "first_missing_field": __first_missing,
+                                                        "attempt": __attempt,
+                                                        "message": "Required booking fields are missing or invalid, so the appointment was not sent to EPAAD.",
+                                                        "instruction": __field_questions.get(__first_missing, "Ask only for the first missing field, then retry booking with all previously collected fields."),
+                                                    }
+                                                )
+
+                                            def _recent_customer_text(limit: int = 12) -> str:
+                                                _texts: List[str] = []
+                                                if session_id:
+                                                    _sess = session_manager.active_sessions.get(session_id)
+                                                    if _sess:
+                                                        _texts.extend(
+                                                            str(entry.get("utterance_text") or "")
+                                                            for entry in _sess.recent_transcript[-limit:]
+                                                            if entry.get("speaker") == "customer"
+                                                        )
+                                                _texts.extend(recent_customer_utterances[-limit:])
+                                                return " ".join(text for text in _texts if text)
+
+                                            def _normalize_evidence_text(value: str) -> str:
+                                                value = unicodedata.normalize("NFKD", value or "")
+                                                value = "".join(ch for ch in value if not unicodedata.combining(ch))
+                                                return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+                                            def _address_supported_by_recent_speech(
+                                                street: str,
+                                                street_number: str,
+                                                zip_code: str,
+                                                city: str,
+                                            ) -> bool:
+                                                """Block hallucinated/new-patient addresses before EPAAD.
+
+                                                For unmatched callers, the address must be supported by the
+                                                recent caller transcript. This prevents the model from sending
+                                                a stale candidate address or a guessed address to the booking API.
+                                                """
+                                                _recent_raw = _recent_customer_text()
+                                                if not _recent_raw:
+                                                    return True
+
+                                                _recent_norm = _normalize_evidence_text(_recent_raw)
+                                                _recent_compact = re.sub(r"[^a-z0-9]+", "", _recent_norm)
+                                                _recent_digits = re.sub(r"\D", "", _recent_raw)
+
+                                                _zip = re.sub(r"\D", "", str(zip_code or ""))
+                                                _number = _normalize_street_number_for_epaad(street_number or "")
+                                                _number_digits = re.sub(r"\D", "", _number)
+                                                _number_compact = re.sub(r"[^a-z0-9]+", "", _number.lower())
+                                                _street_tokens = [
+                                                    token for token in _normalize_evidence_text(street).split()
+                                                    if len(token) >= 4
+                                                ]
+                                                _city_tokens = [
+                                                    token for token in _normalize_evidence_text(city).split()
+                                                    if len(token) >= 4
+                                                ]
+
+                                                _zip_ok = bool(_zip and _zip in _recent_digits)
+                                                _number_ok = bool(
+                                                    (_number_compact and _number_compact in _recent_compact)
+                                                    or (_number_digits and _number_digits in _recent_digits)
+                                                )
+                                                _street_ok = any(token in _recent_norm.split() for token in _street_tokens)
+                                                _city_ok = any(token in _recent_norm.split() for token in _city_tokens)
+                                                _evidence_count = sum([_zip_ok, _number_ok, _street_ok, _city_ok])
+
+                                                if _zip and _number_digits:
+                                                    return _evidence_count >= 2 and (_zip_ok or _number_ok)
+                                                if _zip or _number_digits:
+                                                    return (_zip_ok or _number_ok) and _evidence_count >= 1
+                                                return _street_ok and (_city_ok or _evidence_count >= 2)
+
+                                            def _dob_supported_by_recent_speech(dob: str) -> bool:
+                                                """Reject a DOB year that conflicts with the caller transcript."""
+                                                if not dob:
+                                                    return False
+                                                try:
+                                                    _dob_year = datetime.fromisoformat(dob[:10]).year
+                                                except ValueError:
+                                                    return False
+
+                                                _recent_raw = _recent_customer_text()
+                                                if not _recent_raw:
+                                                    return True
+
+                                                _spoken_digits = re.sub(r"\D", "", _recent_raw)
+                                                _spoken_years = {
+                                                    int(year)
+                                                    for year in re.findall(r"(?:19|20)\d{2}", _spoken_digits)
+                                                }
+                                                return not _spoken_years or _dob_year in _spoken_years
+
                                             if _func_name == "resolve_phonebook_identity":
                                                 try:
                                                     __first = (_args.get("patient_first_name") or "").strip()
@@ -862,11 +1406,17 @@ class RTMiddleTier:
                                                         last_name=__last,
                                                     )
                                                     logger.info(
-                                                        "[PHONEBOOK] Identity resolution session=%s matched=%s candidate_count=%s",
+                                                        "[PHONEBOOK] Identity resolution session=%s matched=%s status=%s candidate_count=%s do_not_ask=%s must_ask=%s",
                                                         session_id,
                                                         __resolution.get("matched"),
+                                                        __resolution.get("status"),
                                                         __resolution.get("candidate_count"),
+                                                        __resolution.get("do_not_ask"),
+                                                        __resolution.get("must_ask"),
                                                     )
+                                                    if session_id and __resolution.get("matched"):
+                                                        session_manager.clear_recoverable_office_handoff(session_id, "confused_or_incoherent")
+                                                        await apply_verified_patient_context(__resolution)
                                                     _result = _json_dumps(__resolution)
                                                 except Exception as __e:
                                                     logger.error(f"Error in resolve_phonebook_identity: {__e}")
@@ -1152,6 +1702,9 @@ class RTMiddleTier:
                                                                 __resolution.get("matched"),
                                                                 __resolution.get("candidate_count"),
                                                             )
+                                                            if __resolution.get("matched"):
+                                                                session_manager.clear_recoverable_office_handoff(session_id, "confused_or_incoherent")
+                                                                await apply_verified_patient_context(__resolution)
                                                     except Exception as __resolve_err:
                                                         logger.warning(f"[PHONEBOOK] Booking-time identity resolution failed: {__resolve_err}")
 
@@ -1189,9 +1742,7 @@ class RTMiddleTier:
                                                         logger.warning(f"[BOOKING AUTO-FILL] Failed to auto-fill from phonebook: {__auto_err}")
                                                     # --- END AUTO-FILL ---
 
-                                                    __dob = _args.get("patient_dob", "")
-                                                    if len(__dob) == 10:
-                                                        __dob += "T00:00:00"
+                                                    __dob = _normalize_dob_for_epaad(_args.get("patient_dob", ""))
                                                     __phone = _args.get("patient_phone")
                                                     # Ensure we always have the real caller phone number
                                                     try:
@@ -1205,6 +1756,67 @@ class RTMiddleTier:
                                                         pass
                                                     __visit_reason = _args.get("visit_reason", "")
                                                     __comment = _args.get("comment", "")
+                                                    __street, __street_number = _split_street_and_number(
+                                                        _args.get("street", ""),
+                                                        _args.get("street_number", ""),
+                                                    )
+                                                    __zip_code = re.sub(r"\D", "", str(_args.get("zip_code", "") or ""))
+                                                    __city = "" if _is_missing(_args.get("city")) else str(_args.get("city", "")).strip()
+
+                                                    __missing_fields: List[str] = []
+                                                    if _is_missing(__dob):
+                                                        __missing_fields.append("patient_dob")
+                                                    if _is_missing(__street):
+                                                        __missing_fields.append("street")
+                                                    if _is_missing(__street_number) or not re.search(r"\d", __street_number):
+                                                        __missing_fields.append("street_number")
+                                                    if _is_missing(__zip_code):
+                                                        __missing_fields.append("zip_code")
+                                                    if _is_missing(__city):
+                                                        __missing_fields.append("city")
+                                                    if _is_missing(__visit_reason):
+                                                        __missing_fields.append("visit_reason")
+
+                                                    if __missing_fields:
+                                                        logger.warning(
+                                                            "[BOOKING BLOCKED] Missing required fields before EPAAD call session=%s fields=%s",
+                                                            session_id,
+                                                            __missing_fields,
+                                                        )
+                                                        _result = await _missing_booking_field_response(__missing_fields)
+                                                        raise ValueError("blocked: missing required booking fields")
+
+                                                    if not _resolved_phonebook_match() and not _dob_supported_by_recent_speech(__dob):
+                                                        logger.warning(
+                                                            "[BOOKING BLOCKED] DOB year conflicts with recent caller speech session=%s dob=%r",
+                                                            session_id,
+                                                            __dob,
+                                                        )
+                                                        _result = await _missing_booking_field_response(["patient_dob_confirmation"])
+                                                        raise ValueError("blocked: DOB not verified by caller speech")
+
+                                                    if not _resolved_phonebook_match() and not _address_supported_by_recent_speech(
+                                                        __street,
+                                                        __street_number,
+                                                        __zip_code,
+                                                        __city,
+                                                    ):
+                                                        logger.warning(
+                                                            "[BOOKING BLOCKED] Address not supported by recent caller speech session=%s street=%r number=%r zip=%r city=%r",
+                                                            session_id,
+                                                            __street,
+                                                            __street_number,
+                                                            __zip_code,
+                                                            __city,
+                                                        )
+                                                        _result = await _missing_booking_field_response(["address_confirmation"])
+                                                        raise ValueError("blocked: address not verified by caller speech")
+
+                                                    _args["patient_dob"] = __dob
+                                                    _args["street"] = __street
+                                                    _args["street_number"] = __street_number
+                                                    _args["zip_code"] = __zip_code
+                                                    _args["city"] = __city
 
                                                     # --- APPOINTMENT TYPE SELECTION LOGIC ---
                                                     __appointment_type_id = 61
@@ -1241,7 +1853,7 @@ class RTMiddleTier:
                                                         logger.info(f"[BOOKING] Type 61 (15 min)")
                                                     # --- END APPOINTMENT TYPE SELECTION ---
 
-                                                    # Map gender: prefer AI-detected voice gender, then phonebook fallback
+                                                    # Map gender: prefer tool value, then phonebook, then audio classifier.
                                                     __gender = (_args.get("patient_gender") or "").lower()
                                                     if __gender not in ["male", "female"]:
                                                         __gender = "other"
@@ -1256,8 +1868,18 @@ class RTMiddleTier:
                                                                 logger.info(f"[GENDER] From resolved phonebook match: '{__gender}'")
                                                         except Exception as __ge:
                                                             logger.warning(f"[GENDER] Phonebook gender lookup failed: {__ge}")
+                                                    if __gender not in ["male", "female"]:
+                                                        __voice_gender = _gender_estimator.classification()
+                                                        __confidence = _gender_estimator.confidence()
+                                                        if __voice_gender in ["male", "female"]:
+                                                            __gender = __voice_gender
+                                                        logger.info(
+                                                            "[GENDER] selected=%s source=%s confidence=%.2f",
+                                                            __gender,
+                                                            "voice_classifier" if __voice_gender in ["male", "female"] else "fallback",
+                                                            __confidence,
+                                                        )
 
-                                                    __city = _args.get("city", "")
                                                     __state = "BS" if "basel" in __city.lower() else ""
 
                                                     __full_comment = __visit_reason
@@ -1274,9 +1896,9 @@ class RTMiddleTier:
                                                             "birthDate": __dob,
                                                             "gender": __gender,
                                                             "address": {
-                                                                "street": _args.get("street", ""),
-                                                                "streetNumber": _args.get("street_number", ""),
-                                                                "zipCode": _args.get("zip_code", ""),
+                                                                "street": __street,
+                                                                "streetNumber": __street_number,
+                                                                "zipCode": __zip_code,
                                                                 "city": __city,
                                                                 "state": __state,
                                                                 "country": "CH"
@@ -1405,18 +2027,26 @@ class RTMiddleTier:
 
                                                         # --- AUTO-HANGUP FALLBACK ---
                                                         # If the AI fails to call terminate_call after booking,
-                                                        # auto-hangup after 60 seconds so the call doesn't hang.
-                                                        # Longer timeout since AI now asks "anything else?" before ending.
+                                                        # auto-hangup once the caller has genuinely gone quiet —
+                                                        # not on a blind wall-clock timer, so a caller still asking
+                                                        # follow-up questions doesn't get cut off mid-conversation.
                                                         async def _auto_hangup_fallback():
-                                                            await asyncio.sleep(60)
-                                                            if not call_end_requested.is_set():
-                                                                logger.warning(f"[AUTO-HANGUP] 60s passed after booking — terminate_call was NOT called. session={session_id}")
-                                                                call_end_requested.set()
-                                                                _hung = await _do_acs_hangup("auto_hangup_post_booking")
-                                                                if not _hung:
-                                                                    logger.error("[AUTO-HANGUP] Fallback hangup FAILED — call may remain connected")
-                                                            else:
-                                                                logger.debug("[AUTO-HANGUP] call_end_requested already set — skipping (terminate_call was called)")
+                                                            while True:
+                                                                await asyncio.sleep(15)
+                                                                if call_end_requested.is_set():
+                                                                    logger.debug("[AUTO-HANGUP] call_end_requested already set — skipping (terminate_call was called)")
+                                                                    return
+                                                                _idle_for = loop.time() - last_user_activity_ts
+                                                                if _idle_for >= 60:
+                                                                    logger.warning(
+                                                                        f"[AUTO-HANGUP] {_idle_for:.0f}s of silence after booking — "
+                                                                        f"terminate_call was NOT called. session={session_id}"
+                                                                    )
+                                                                    call_end_requested.set()
+                                                                    _hung = await _do_acs_hangup("auto_hangup_post_booking")
+                                                                    if not _hung:
+                                                                        logger.error("[AUTO-HANGUP] Fallback hangup FAILED — call may remain connected")
+                                                                    return
                                                         _dynamic_tasks.append(asyncio.create_task(_auto_hangup_fallback()))
                                                         # --- END AUTO-HANGUP FALLBACK ---
 
@@ -1594,7 +2224,10 @@ class RTMiddleTier:
                                             _dynamic_tasks.append(asyncio.create_task(_unsuppress_after_delay()))
                                         # --- END TURN DETECTION ---
 
-                                    if suppress_agent_audio and event_type == "response.audio.delta":
+                                    if suppress_agent_audio and event_type in {
+                                        "response.audio.delta",
+                                        "response.output_audio.delta",
+                                    }:
                                         continue
                                     
                                     # Extract transcription data if available
@@ -1611,7 +2244,13 @@ class RTMiddleTier:
                                                         "session_id": session_id,
                                                         "speaker": transcription_data.get("speaker", "unknown"),
                                                         "utterance_text": transcription_data.get("utterance_text", ""),
-                                                        "timestamp": transcription_data.get("timestamp")
+                                                        "timestamp": transcription_data.get("timestamp"),
+                                                        "source": transcription_data.get("source"),
+                                                        "model": (
+                                                            self.live_transcribe_deployment
+                                                            if transcription_data.get("speaker") == "customer"
+                                                            else self.deployment
+                                                        ),
                                                     })
                                                     # Schedule flush if not already running
                                                     if _transcription_flush_task is None:
@@ -1619,36 +2258,63 @@ class RTMiddleTier:
                                                     # Log transcript locally (fast, non-blocking)
                                                     speaker = transcription_data.get("speaker")
                                                     text = transcription_data.get("utterance_text", "")[:50]
-                                                    logger.info(f"[TRANSCRIPT] {speaker}: {text}...")
+                                                    transcript_model = (
+                                                        self.live_transcribe_deployment
+                                                        if speaker == "customer"
+                                                        else self.deployment
+                                                    )
+                                                    logger.info(f"[TRANSCRIPT:{transcript_model}] {speaker}: {text}...")
                                                 except Exception as e:
                                                     logger.error(f"[TRANSCRIPT ERROR] {e}")
 
                                             # Detect language from the caller only. Agent greeting/holding
                                             # prompts should not flip the conversation language.
                                             if transcription_data.get("speaker") == "customer":
-                                                text = transcription_data.get("utterance_text", "").strip().lower()
-                                                _language_switched = False
-                                                # Check for explicit language switch phrases first
-                                                if any(phrase in text for phrase in ["speak english", "in english", "switch to english", "we can speak english"]):
-                                                    await set_conversation_language("en", "explicit English request")
-                                                    _language_switched = True
-                                                # Also detect from German phrases
-                                                elif any(phrase in text for phrase in ["deutsch", "auf deutsch", "auf deutsch sprechen"]):
-                                                    await set_conversation_language("de", "explicit German request")
-                                                    _language_switched = True
-                                                else:
-                                                    _kurdish_lang = _detect_kurdish_language(text)
-                                                    if _kurdish_lang:
-                                                        await set_conversation_language(_kurdish_lang, "Kurdish dialect/request detected")
-                                                        _language_switched = True
-                                                # Fall back to language detection for meaningful utterances.
-                                                if not _language_switched and detect_lang and len(text) > 12:
+                                                _customer_text_raw = transcription_data.get("utterance_text", "").strip()
+                                                if _customer_text_raw:
+                                                    recent_customer_utterances.append(_customer_text_raw)
+                                                    recent_customer_utterances[:] = recent_customer_utterances[-16:]
+                                                text = _customer_text_raw.lower()
+                                                _language_handled = False
+                                                if not language_locked:
+                                                    # Explicit language preference locks the session language.
+                                                    if any(phrase in text for phrase in ["speak english", "in english", "switch to english", "we can speak english", "english please", "english", "englisch"]):
+                                                        await set_conversation_language("en", "explicit English request", lock=True)
+                                                        _language_handled = True
+                                                    elif any(phrase in text for phrase in ["deutsch", "auf deutsch", "auf deutsch sprechen", "german please", "speak german"]):
+                                                        await set_conversation_language("de", "explicit German request", lock=True)
+                                                        _language_handled = True
+                                                    elif any(phrase in text for phrase in ["français", "francais", "french", "französisch", "franzoesisch"]):
+                                                        await set_conversation_language("fr", "explicit French request", lock=True)
+                                                        _language_handled = True
+                                                    elif any(phrase in text for phrase in ["italiano", "italian", "italienisch"]):
+                                                        await set_conversation_language("it", "explicit Italian request", lock=True)
+                                                        _language_handled = True
+                                                    elif any(phrase in text for phrase in ["español", "espanol", "spanish", "spanisch"]):
+                                                        await set_conversation_language("es", "explicit Spanish request", lock=True)
+                                                        _language_handled = True
+                                                    elif any(phrase in text for phrase in ["turkish", "türkçe", "tuerkisch", "türkisch"]):
+                                                        await set_conversation_language("tr", "explicit Turkish request", lock=True)
+                                                        _language_handled = True
+                                                    elif any(phrase in text for phrase in ["arabic", "arabisch", "العربية", "عربي"]):
+                                                        await set_conversation_language("ar", "explicit Arabic request", lock=True)
+                                                        _language_handled = True
+                                                    else:
+                                                        _kurdish_lang = _detect_kurdish_language(text)
+                                                        if _kurdish_lang:
+                                                            await set_conversation_language(_kurdish_lang, "Kurdish dialect/request detected", lock=True)
+                                                            _language_handled = True
+
+                                                # Automatic detection is used only to lock German or to ask
+                                                # confirmation for non-German. It must never directly switch
+                                                # the session language from noisy or mixed-language fragments.
+                                                if not _language_handled and not language_locked and detect_lang and len(text) > 12:
                                                     try:
                                                         _lang = await asyncio.to_thread(detect_lang, text)
-                                                        if _lang == "ku":
-                                                            _lang = "ku"
-                                                        if _lang and _lang in ("en", "de", "fr", "it", "es", "tr", "ar", "ku") and _lang != detected_conversation_language:
-                                                            await set_conversation_language(_lang, "automatic language detection")
+                                                        if _lang == "de":
+                                                            await set_conversation_language("de", "German detected", lock=True)
+                                                        elif _lang in ("en", "fr", "it", "es", "tr", "ar", "ku"):
+                                                            await request_language_confirmation(_lang, "automatic language detection")
                                                     except Exception:
                                                         pass
                                     except Exception as e:
@@ -1662,17 +2328,27 @@ class RTMiddleTier:
                                         
                                     if data:
                                         if is_acs_audio_stream and data.get("kind") == "AudioData":
+                                            if not _first_audio_sent:
+                                                _first_audio_sent = True
+                                                logger.info(
+                                                    f"[AUDIO TIMING] First audio chunk queued for ACS session={session_id} "
+                                                    f"elapsed={loop.time() - _call_start_ts:.2f}s since call start"
+                                                )
                                             await enqueue_acs_audio_message(data)
                                         else:
                                             await ws.send_text(_json_dumps(data))
                                 elif msg.type == aiohttp.WSMsgType.ERROR:
-                                    logger.error(f"WebSocket error: {target_ws.exception()}")
+                                    logger.error(f"[LOOP EXIT] from_server_to_client WebSocket error (OpenAI side) session={session_id}: {target_ws.exception()}")
                                     break
+                            logger.info(
+                                f"[LOOP EXIT] from_server_to_client ended (OpenAI side closed) session={session_id} "
+                                f"target_ws_closed={target_ws.closed} close_code={target_ws.close_code}"
+                            )
                         except asyncio.CancelledError:
                             logger.debug("Server→client cancelled")
                             return
                         except Exception as e:
-                            logger.exception("Server→client error")
+                            logger.exception(f"[LOOP EXIT] from_server_to_client error (OpenAI side) session={session_id}: {e}")
                             return
 
                     try:

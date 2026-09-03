@@ -199,25 +199,43 @@ async def handle_callback(contextId: str, request: Request):
             
                 
             elif event.type == "Microsoft.Communication.MediaStreamingStarted":
-                generic_event["details"]["mediaStreamingUpdate"] = event.data.get("mediaStreamingUpdate")
-                
+                _msu = event.data.get("mediaStreamingUpdate") or {}
+                generic_event["details"]["mediaStreamingUpdate"] = _msu
+                logger.info(
+                    f"[MEDIA STREAMING] STARTED session={current_session_id[:8] if current_session_id else '?'}, "
+                    f"call_connection_id={call_connection_id}, status={_msu.get('mediaStreamingStatus')}, "
+                    f"details={_msu.get('mediaStreamingStatusDetails')}"
+                )
+
                 await session_manager.log_event(
                     session_id=current_session_id,
                     event_data=generic_event
                 )
-                
+
             elif event.type == "Microsoft.Communication.MediaStreamingStopped":
-                generic_event["details"]["mediaStreamingUpdate"] = event.data.get("mediaStreamingUpdate")
-                
+                _msu = event.data.get("mediaStreamingUpdate") or {}
+                generic_event["details"]["mediaStreamingUpdate"] = _msu
+                logger.warning(
+                    f"[MEDIA STREAMING] STOPPED session={current_session_id[:8] if current_session_id else '?'}, "
+                    f"call_connection_id={call_connection_id}, status={_msu.get('mediaStreamingStatus')}, "
+                    f"details={_msu.get('mediaStreamingStatusDetails')}"
+                )
+
                 await session_manager.log_event(
                     session_id=current_session_id,
                     event_data=generic_event
                 )
-                
+
             elif event.type == "Microsoft.Communication.MediaStreamingFailed":
-                generic_event["details"]["mediaStreamingUpdate"] = event.data.get("mediaStreamingUpdate")
+                _msu = event.data.get("mediaStreamingUpdate") or {}
+                generic_event["details"]["mediaStreamingUpdate"] = _msu
                 generic_event["status"] = 'error'
-                
+                logger.error(
+                    f"[MEDIA STREAMING] FAILED session={current_session_id[:8] if current_session_id else '?'}, "
+                    f"call_connection_id={call_connection_id}, status={_msu.get('mediaStreamingStatus')}, "
+                    f"details={_msu.get('mediaStreamingStatusDetails')}"
+                )
+
                 await session_manager.log_event(
                     session_id=current_session_id,
                     event_data=generic_event
