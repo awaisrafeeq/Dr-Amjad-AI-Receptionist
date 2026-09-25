@@ -204,7 +204,12 @@ def transform_acs_to_openai_format(
                     "input": {
                         "format": {"type": "audio/pcm", "rate": 24000},
                         "transcription": transcription,
-                        "noise_reduction": {"type": "near_field"},
+                        # far_field matches phone/PSTN audio (handset distance, codec
+                        # artifacts, background noise) — near_field is tuned for
+                        # close-talking headset mics and was stripping enough of
+                        # some callers' voices that the ASR produced no text at all
+                        # despite VAD still detecting speech.
+                        "noise_reduction": {"type": "far_field"},
                         "turn_detection": {
                             "type": "server_vad",
                             "threshold": 0.5,
@@ -222,8 +227,10 @@ def transform_acs_to_openai_format(
                 "tools": legacy_session.get("tools", []),
                 "tool_choice": legacy_session.get("tool_choice", "auto"),
             }
-            if temperature is not None:
-                ga_session["temperature"] = temperature
+            # NOTE: GA Realtime sessions reject a top-level "temperature" field
+            # ("Unknown parameter: 'session.temperature'") — the GA schema does
+            # not expose sampling temperature at the session level, unlike the
+            # preview/legacy session object above. Do not add it here.
             if max_tokens is not None:
                 ga_session["max_output_tokens"] = max_tokens
             oai_message["session"] = ga_session
